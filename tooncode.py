@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.9"
+VERSION = "2.3.0"
 
 import httpx
 import json
@@ -2917,27 +2917,53 @@ def _get_current_api_url() -> str:
 
 def _validate_messages(messages: list):
     """Fix message ordering issues before sending to API."""
-    # Rule: tool_result must follow assistant with tool_use
-    # Rule: alternating user/assistant (with tool_result counting as user)
+    # Rules:
+    # 1. Must alternate user/assistant
+    # 2. tool_result (in user msg) must come right after assistant with tool_use
+    # 3. First message must be user
     fixed = []
-    for i, msg in enumerate(messages):
+    for msg in messages:
         role = msg.get("role", "")
-        # Skip empty messages
         content = msg.get("content", [])
         if not content:
             continue
-        # Prevent consecutive same-role messages (except tool_result after user)
-        if fixed:
-            prev_role = fixed[-1].get("role", "")
-            if role == prev_role and role == "user":
-                # Check if this is tool_result (allowed after tool_use response)
-                is_tool_result = isinstance(content, list) and any(
-                    b.get("type") == "tool_result" for b in content if isinstance(b, dict))
-                if not is_tool_result:
-                    fixed.append({"role": "assistant", "content": [{"type": "text", "text": "(continuing)"}]})
-            elif role == prev_role and role == "assistant":
+
+        # Detect message types
+        is_tool_result = isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+        has_tool_use = isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
+
+        if not fixed:
+            # First message must be user
+            if role != "user":
+                fixed.append({"role": "user", "content": [{"type": "text", "text": "(start)"}]})
+            fixed.append(msg)
+            continue
+
+        prev = fixed[-1]
+        prev_role = prev.get("role", "")
+        prev_content = prev.get("content", [])
+        prev_has_tool_use = isinstance(prev_content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_use" for b in prev_content)
+
+        # tool_result must follow assistant with tool_use
+        if is_tool_result and role == "user":
+            if prev_role != "assistant" or not prev_has_tool_use:
+                # Remove this tool_result — it's orphaned
+                continue
+            fixed.append(msg)
+            continue
+
+        # Fix consecutive same role
+        if role == prev_role:
+            if role == "user":
+                fixed.append({"role": "assistant", "content": [{"type": "text", "text": "(continuing)"}]})
+            else:
                 fixed.append({"role": "user", "content": [{"type": "text", "text": "(continue)"}]})
+
         fixed.append(msg)
+
     messages.clear()
     messages.extend(fixed)
 
