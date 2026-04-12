@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.4"
+VERSION = "2.3.5"
 
 import httpx
 import json
@@ -1282,6 +1282,10 @@ def exec_read(args: dict) -> str:
                 f"{'[dir] ' if os.path.isdir(os.path.join(fpath, e)) else ''}{e}"
                 for e in sorted(entries)
             )
+        # Skip huge files
+        fsize = os.path.getsize(fpath)
+        if fsize > 10_000_000:  # 10MB
+            return f"[error: file too large ({fsize//1_000_000}MB). Use bash to read specific parts: head/tail]"
         with open(fpath, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
         start = max(0, offset - 1)
@@ -2391,7 +2395,8 @@ CHANNEL PROTOCOL:
 - Read channel messages to see what others are doing
 - Send messages with: start your text with @role to address someone
 - When you finish your part, send a summary to channel
-- Read files that others created before building on them"""
+- ALWAYS read files before editing (another agent may have changed them)
+- Do NOT edit files that another agent is currently working on"""
 
     messages = [{"role": "user", "content": [{"type": "text", "text":
         f"Team task: {task}\n\nCheck the channel for your assignments. If you're the planner, create the plan first. Otherwise, wait for instructions or start on your part.\n\nChannel messages so far:\n" +
@@ -4569,7 +4574,9 @@ OUTPUT THE JSON ARRAY NOW:"""
                     console.print(f"[info]Merged branch '{worktree_branch}' successfully.[/info]")
                 else:
                     console.print(f"[error]Merge failed: {merge_output}[/error]")
-                    console.print("[info]You may need to resolve conflicts manually.[/info]")
+                    # Abort failed merge to keep clean state
+                    subprocess.run("git merge --abort", shell=True, capture_output=True, cwd=CWD)
+                    console.print(f"[info]Merge aborted. Branch '{worktree_branch}' still exists — merge manually with: git merge {worktree_branch}[/info]")
 
             # Remove the worktree
             remove_result = subprocess.run(
