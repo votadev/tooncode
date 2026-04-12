@@ -1084,8 +1084,11 @@ def _ask_permission(action: str, detail: str) -> bool:
 def exec_bash(args: dict) -> str:
     cmd = args.get("command", "")
     workdir = args.get("workdir", CWD)
-    timeout_ms = args.get("timeout", 120000)
-    timeout_s = timeout_ms / 1000
+    try:
+        timeout_ms = float(args.get("timeout", 120000))
+    except (ValueError, TypeError):
+        timeout_ms = 120000
+    timeout_s = max(1, min(timeout_ms / 1000, 600))  # clamp 1s-600s
     background = args.get("background", False)
 
     # Check if command needs permission
