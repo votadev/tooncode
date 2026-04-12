@@ -1789,6 +1789,208 @@ You are a sub-agent. Complete the task and report your result concisely."""
         return f"[agent error: {e}]"
 
 
+# ============================================================================
+# Team Mode — multiple agents working together autonomously
+# ============================================================================
+
+_TEAM_ROLES = {
+    "planner": {
+        "emoji": "📋",
+        "color": "cyan",
+        "system": """You are the PLANNER. Your job:
+1. Read the task and break it into clear steps
+2. Use glob/read to understand the project
+3. Write a plan and assign work to other agents via the channel
+4. Send messages like: "@coder create index.html with ..." or "@tester write tests for ..."
+Always start by reading existing files. Output a numbered plan.""",
+    },
+    "frontend": {
+        "emoji": "🎨",
+        "color": "green",
+        "system": """You are the FRONTEND agent. You build UI: HTML, CSS, JS, React, etc.
+Read channel messages for your assignments. When done, send results back.
+Use write/edit tools. Always read files before editing.
+Send "@reviewer please check my frontend code" when done.""",
+    },
+    "backend": {
+        "emoji": "⚙️",
+        "color": "yellow",
+        "system": """You are the BACKEND agent. You build APIs, databases, server logic.
+Read channel messages for your assignments. When done, send results back.
+Use write/edit/bash tools. Always read files before editing.
+Send "@tester please test the API" when done.""",
+    },
+    "reviewer": {
+        "emoji": "🔍",
+        "color": "magenta",
+        "system": """You are the REVIEWER. Read code written by other agents, find bugs, fix them.
+Read channel messages. When asked to review, read the files and check.
+Use edit tool to fix issues directly. Report: PASS or list of fixes.
+Send results back to channel.""",
+    },
+    "tester": {
+        "emoji": "🧪",
+        "color": "red",
+        "system": """You are the TESTER. Write and run tests for code written by other agents.
+Read channel messages for test requests. Write test files, run with bash.
+Report results back to channel. If tests fail, send "@coder fix: ..." """,
+    },
+}
+
+_team_threads = []
+_team_channel = []  # shared in-memory channel for team
+_team_lock = threading.Lock()
+_team_running = False
+
+
+def _team_agent_loop(role: str, task: str, agent_id: str):
+    """One team agent running autonomously."""
+    config = _TEAM_ROLES[role]
+    emoji = config["emoji"]
+    color = config["color"]
+
+    system = f"""{config['system']}
+
+Working directory: {CWD}
+Platform: {platform.system()}
+Your agent ID: {agent_id}
+Team task: {task}
+
+CHANNEL PROTOCOL:
+- Read channel messages to see what others are doing
+- Send messages with: start your text with @role to address someone
+- When you finish your part, send a summary to channel
+- Read files that others created before building on them"""
+
+    messages = [{"role": "user", "content": [{"type": "text", "text":
+        f"Team task: {task}\n\nCheck the channel for your assignments. If you're the planner, create the plan first. Otherwise, wait for instructions or start on your part.\n\nChannel messages so far:\n" +
+        "\n".join(f"[{m['from']}] {m['text']}" for m in _team_channel[-20:]) if _team_channel else "(empty — you're first!)"}]}]
+
+    headers = make_request_headers()
+    max_iterations = 10
+
+    for iteration in range(max_iterations):
+        if not _team_running:
+            break
+
+        # Inject latest channel messages
+        if iteration > 0 and _team_channel:
+            recent = [f"[{m['from']}] {m['text']}" for m in _team_channel[-10:]]
+            messages.append({"role": "user", "content": [{"type": "text", "text":
+                f"Channel update:\n" + "\n".join(recent) + "\n\nContinue your work or respond to messages."}]})
+
+        try:
+            body = {
+                "model": MODEL,
+                "max_tokens": 16000,
+                "system": [{"type": "text", "text": system}],
+                "messages": messages[-12:],  # keep context manageable
+                "tools": _SUBAGENT_TOOLS,
+                "tool_choice": {"type": "auto"},
+                "stream": False,
+            }
+            if MODEL not in NO_SAMPLING_PARAMS:
+                body["temperature"] = 1
+                body["top_k"] = 40
+                body["top_p"] = 0.95
+
+            with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+                resp = client.post(API_URL, headers=headers, json=body)
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+
+            content = data.get("content", [])
+            if not content:
+                break
+
+            # Process text — extract channel messages
+            for block in content:
+                if block.get("type") == "text" and block.get("text"):
+                    text = block["text"].strip()
+                    if text:
+                        with _team_lock:
+                            _team_channel.append({"from": f"{emoji} {role}", "text": text[:300], "time": time.time()})
+                        console.print(f"  [{color}]{emoji} {role}[/{color}]: {text[:200]}")
+
+            # Process tools
+            tool_blocks = [b for b in content if b.get("type") == "tool_use"]
+            if not tool_blocks:
+                break
+
+            messages.append({"role": "assistant", "content": content})
+
+            tool_results = []
+            for tb in tool_blocks:
+                name = tb["name"]
+                inp = tb.get("input", {})
+                tid = tb["id"]
+                handler = TOOL_HANDLERS.get(name)
+                if handler and name not in ("spawn_agent", "browser"):
+                    console.print(f"  [dim]{emoji} {role} → {name}[/dim]")
+                    result = handler(inp)
+                else:
+                    result = f"[not available for team agents: {name}]"
+                tool_results.append({"type": "tool_result", "tool_use_id": tid, "content": result[:5000]})
+
+            messages.append({"role": "user", "content": tool_results})
+            time.sleep(1)  # small delay between iterations
+
+        except Exception as e:
+            console.print(f"  [red]{emoji} {role} error: {e}[/red]")
+            break
+
+    console.print(f"  [{color}]{emoji} {role} finished[/{color}]")
+
+
+def run_team(task: str, roles: list = None):
+    """Start a team of agents working together."""
+    global _team_running, _team_threads, _team_channel
+
+    if not roles:
+        roles = ["planner", "frontend", "backend"]
+
+    # Validate roles
+    for r in roles:
+        if r not in _TEAM_ROLES:
+            console.print(f"[error]Unknown role: {r}. Available: {', '.join(_TEAM_ROLES.keys())}[/error]")
+            return
+
+    _team_running = True
+    _team_channel.clear()
+    _team_threads.clear()
+
+    console.print(f"\n[bold cyan]Starting team ({len(roles)} agents):[/bold cyan]")
+    for r in roles:
+        cfg = _TEAM_ROLES[r]
+        console.print(f"  {cfg['emoji']} {r}")
+    console.print()
+
+    # Start planner first, others after a delay
+    for i, role in enumerate(roles):
+        agent_id = f"team-{role}-{os.getpid()}"
+        t = threading.Thread(target=_team_agent_loop, args=(role, task, agent_id), daemon=True)
+        _team_threads.append(t)
+
+    # Stagger starts: planner first, then others
+    _team_threads[0].start()
+    time.sleep(3)  # let planner create the plan
+    for t in _team_threads[1:]:
+        t.start()
+        time.sleep(1)
+
+    # Wait for all to finish
+    for t in _team_threads:
+        t.join(timeout=300)  # 5 min max per agent
+
+    _team_running = False
+    console.print(f"\n[bold green]Team finished! {len(_team_channel)} messages exchanged.[/bold green]")
+
+    # Return summary
+    summary = "\n".join(f"[{m['from']}] {m['text']}" for m in _team_channel)
+    return summary
+
+
 TOOL_HANDLERS = {
     "bash": exec_bash,
     "read": exec_read,
@@ -3059,6 +3261,44 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
             console.print("[info]Usage: /bg [kill <id|all>] [logs <id>][/info]")
             return True
 
+    elif command == "/team":
+        if not arg:
+            console.print("[info]Usage: /team <task> [--roles planner,frontend,backend,reviewer,tester][/info]")
+            console.print(f"[info]Available roles: {', '.join(_TEAM_ROLES.keys())}[/info]")
+            console.print("[info]Default: planner + frontend + backend[/info]")
+            console.print("[info]/team stop — stop running team[/info]")
+            return True
+
+        if arg == "stop":
+            global _team_running
+            _team_running = False
+            console.print("[info]Stopping team...[/info]")
+            return True
+
+        # Parse roles from --roles flag
+        roles = None
+        task_text = arg
+        if "--roles" in arg:
+            parts_r = arg.split("--roles")
+            task_text = parts_r[0].strip()
+            role_str = parts_r[1].strip().split()[0] if len(parts_r) > 1 else ""
+            if role_str:
+                roles = [r.strip() for r in role_str.split(",") if r.strip()]
+
+        summary = run_team(task_text, roles)
+        if summary:
+            messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text":
+                    f"[Team work completed]\nTask: {task_text}\n\nTeam conversation:\n{summary[:3000]}",
+                    "cache_control": {"type": "ephemeral"}}],
+            })
+            messages.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Team work complete. The agents have finished their tasks."}],
+            })
+        return True
+
     elif command in ("/send", "/chat"):
         # Send message to other ToonCode instances via shared channel
         channel_dir = os.path.join(os.path.expanduser("~"), ".tooncode", "channels")
@@ -3146,6 +3386,7 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         help_table.add_row("/status", "Git status")
         help_table.add_row("/undo", "Undo last file edit")
         help_table.add_row("/bg, /ps", "List background processes (kill/logs)")
+        help_table.add_row("/team <task>", "Start multi-agent team (planner+frontend+backend+...)")
         help_table.add_row("/send <msg>", "Send message to other ToonCode windows")
         help_table.add_row("/send", "Read messages from other windows")
 
