@@ -27,11 +27,24 @@ console.log(`${D}Python: ${python}${X}`);
 
 const req = path.join(__dirname, "..", "requirements.txt");
 if (fs.existsSync(req)) {
-  try {
-    execSync(`${python} -m pip install --quiet --disable-pip-version-check -r "${req}"`, { stdio: ["ignore", "pipe", "pipe"] });
-    console.log(`${G}Dependencies installed.${X}`);
-  } catch {
-    console.log(`${Y}pip failed — run manually: ${python} -m pip install -r ${req}${X}`);
+  // Try multiple pip methods
+  const pipCmds = [
+    `${python} -m pip install --quiet --disable-pip-version-check -r "${req}"`,
+    `pip3 install --quiet -r "${req}"`,
+    `pip install --quiet -r "${req}"`,
+  ];
+  let installed = false;
+  for (const cmd of pipCmds) {
+    try {
+      execSync(cmd, { stdio: ["ignore", "pipe", "pipe"], timeout: 120000 });
+      console.log(`${G}Dependencies installed.${X}`);
+      installed = true;
+      break;
+    } catch {}
+  }
+  if (!installed) {
+    console.log(`${Y}Auto-install failed. Run manually:${X}`);
+    console.log(`${C}  pip install httpx rich prompt_toolkit${X}`);
   }
 }
 

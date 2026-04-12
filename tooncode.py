@@ -27,25 +27,30 @@ import threading
 from datetime import datetime
 from typing import Optional, Dict
 
-from rich.console import Console, Group
-from rich.panel import Panel
-from rich.text import Text
-from rich.markdown import Markdown
-from rich.live import Live
-from rich.rule import Rule
-from rich.style import Style
-from rich.theme import Theme
-from rich.syntax import Syntax
-from rich.table import Table
-from rich.columns import Columns
-
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.styles import Style as PTStyle
-from prompt_toolkit.formatted_text import FormattedText
+try:
+    from rich.console import Console, Group
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.markdown import Markdown
+    from rich.live import Live
+    from rich.rule import Rule
+    from rich.style import Style
+    from rich.theme import Theme
+    from rich.syntax import Syntax
+    from rich.table import Table
+    from rich.columns import Columns
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.styles import Style as PTStyle
+    from prompt_toolkit.formatted_text import FormattedText
+    from prompt_toolkit.completion import Completer, Completion, PathCompleter, merge_completers
+except ImportError as e:
+    print(f"\033[31mMissing dependency: {e}\033[0m")
+    print(f"\033[36mRun: pip install httpx rich prompt_toolkit\033[0m")
+    sys.exit(1)
 
 
 # ============================================================================
