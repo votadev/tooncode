@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 
 import httpx
 import json
@@ -650,8 +650,10 @@ def build_system_prompt() -> str:
 
 # Tool usage
 - Batch independent tool calls in one response for speed.
-{"- For bash: prefer PowerShell on Windows (Get-Date, Get-ChildItem, Get-Process, etc). NEVER use wmic." if platform.system() == "Windows" else "- For bash: use standard Unix commands (ls, cat, grep, etc)."}
+{"- For bash on Windows: use PowerShell cmdlets ONLY. NEVER use Unix commands (grep, sed, awk, head, tail, curl|grep, mkdir -p). Use web_fetch instead of curl. Use Get-ChildItem instead of ls. NEVER use wmic." if platform.system() == "Windows" else "- For bash: use standard Unix commands (ls, cat, grep, etc)."}
 - For bash: NEVER run interactive commands that wait for input.
+- If a bash command fails, try a DIFFERENT approach. Do NOT retry the same command more than once.
+- To read web pages: use `web_fetch` tool (NOT curl). To search: use `web_search` tool.
 
 # Browser & Web
 You have a `browser` tool (Playwright) and `web_fetch` tool:
