@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.2"
+VERSION = "2.2.3"
 
 import httpx
 import json
@@ -5315,11 +5315,16 @@ def main(_initial_prompt=None):
                                     # Inject boss answer as a separate user message after tool results
                                     messages.append({"role": "user", "content": tool_results})
                                     messages.append({"role": "assistant", "content": [{"type": "text", "text": "I'm stuck. Let me check the boss's advice."}]})
+                                    # Parse boss answer for file paths and code blocks
+                                    fix_instructions = f"[BOSSHELP - APPLY NOW]\n{boss_answer}\n\n"
+                                    fix_instructions += "STEP-BY-STEP INSTRUCTIONS:\n"
+                                    fix_instructions += "1. Read each file mentioned above using the read tool\n"
+                                    fix_instructions += "2. Apply each code change using the edit tool (oldString → newString)\n"
+                                    fix_instructions += "3. If the fix says to run a command, use the bash tool\n"
+                                    fix_instructions += "4. After applying, verify with bash (e.g. python -c 'import module')\n"
+                                    fix_instructions += "\nDo NOT explain. Do NOT repeat failed approach. USE TOOLS NOW."
                                     messages.append({"role": "user", "content": [{"type": "text", "text":
-                                        f"[BOSSHELP from Claude Code - APPLY THIS FIX]\n{boss_answer}\n\n"
-                                        f"IMPORTANT: You MUST use tools (edit, write, bash) to apply this fix RIGHT NOW. "
-                                        f"Do NOT just explain what to do. Do NOT repeat the same approach that failed. "
-                                        f"Read the fix above and execute it step by step using your tools.",
+                                        fix_instructions,
                                         "cache_control": {"type": "ephemeral"}}]})
                                     continue  # Skip the normal append below
                         else:
