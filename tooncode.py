@@ -5255,4 +5255,28 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         console.print("\n[dim]Goodbye![/dim]")
     finally:
+        # Cleanup everything on exit
+        # 1. Browser
+        if _browser_worker:
+            try:
+                _browser_worker.close()
+            except Exception:
+                pass
+
+        # 2. Background processes
+        for bg_id, proc in _bg_processes.items():
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        _bg_processes.clear()
+
+        # 3. MCP servers
         _shutdown_mcp_servers()
+
+        # 4. Team agents
+        try:
+            _team_running = False
+        except Exception:
+            pass
