@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.6"
+VERSION = "2.2.7"
 
 import httpx
 import json
@@ -4634,7 +4634,9 @@ OUTPUT THE JSON ARRAY NOW:"""
                                     shell=True, capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=120)
                 if r2.returncode == 0:
-                    console.print(f"[bold green]Updated to v{latest}! Restart tooncode to use new version.[/bold green]")
+                    console.print(f"[bold green]Updated to v{latest}! Restarting...[/bold green]")
+                    # Auto-restart with same args
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
                 else:
                     console.print(f"[error]Update failed: {r2.stderr[:200]}[/error]")
                     console.print("[dim]Try manually: npm install -g @votadev/tooncode[/dim]")
