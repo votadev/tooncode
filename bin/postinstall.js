@@ -27,12 +27,14 @@ console.log(`${D}Python: ${python}${X}`);
 
 const req = path.join(__dirname, "..", "requirements.txt");
 if (fs.existsSync(req)) {
-  // Try multiple pip methods
   const pipCmds = [
-    `${python} -m pip install --quiet --disable-pip-version-check -r "${req}"`,
-    `pip3 install --quiet -r "${req}"`,
-    `pip install --quiet -r "${req}"`,
+    `${python} -m pip install --user --quiet --break-system-packages -r "${req}"`,
+    `${python} -m pip install --user --quiet -r "${req}"`,
+    `${python} -m pip install --quiet -r "${req}"`,
+    `pip3 install --user --quiet --break-system-packages -r "${req}"`,
+    `pip3 install --user --quiet -r "${req}"`,
   ];
+  console.log(`${D}Installing Python packages...${X}`);
   let installed = false;
   for (const cmd of pipCmds) {
     try {
@@ -44,7 +46,7 @@ if (fs.existsSync(req)) {
   }
   if (!installed) {
     console.log(`${Y}Auto-install failed. Run manually:${X}`);
-    console.log(`${C}  pip install httpx rich prompt_toolkit${X}`);
+    console.log(`${C}  pip install --user httpx rich prompt_toolkit${X}`);
   }
 }
 

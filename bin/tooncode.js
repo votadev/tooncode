@@ -26,14 +26,16 @@ function checkDeps(python) {
 function installDeps(python) {
   const req = path.join(__dirname, "..", "requirements.txt");
   const cmds = [
-    `${python} -m pip install --quiet --disable-pip-version-check -r "${req}"`,
-    `pip3 install --quiet -r "${req}"`,
-    `pip install --quiet -r "${req}"`,
+    `${python} -m pip install --user --quiet --break-system-packages -r "${req}"`,
     `${python} -m pip install --user --quiet -r "${req}"`,
+    `${python} -m pip install --quiet -r "${req}"`,
+    `pip3 install --user --quiet --break-system-packages -r "${req}"`,
+    `pip3 install --user --quiet -r "${req}"`,
+    `pip3 install --quiet -r "${req}"`,
   ];
+  console.log(`${D}Installing dependencies...${X}`);
   for (const cmd of cmds) {
     try {
-      console.log(`${D}Installing dependencies...${X}`);
       execSync(cmd, { stdio: ["ignore", "pipe", "pipe"], timeout: 120000 });
       return true;
     } catch {}
