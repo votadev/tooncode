@@ -3444,7 +3444,7 @@ def _load_session(filepath: str) -> Optional[list]:
 
 def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
     """Handle slash commands. Returns True if handled, None to quit, False if not a command."""
-    global MODEL, CWD, plan_mode, _task_counter, _worktree_original_cwd
+    global MODEL, CWD, plan_mode, _task_counter, _worktree_original_cwd, message_count
 
     parts = cmd.strip().split(None, 1)
     command = parts[0].lower()
