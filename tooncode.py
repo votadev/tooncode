@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 
 import httpx
 import json
@@ -96,6 +96,12 @@ def _load_settings() -> dict:
                             existing.add(m["name"])
                 else:
                     settings[k] = v
+        except Exception:
+            pass
+    else:
+        # First run — create default settings.json
+        try:
+            _save_settings(settings)
         except Exception:
             pass
     return settings
