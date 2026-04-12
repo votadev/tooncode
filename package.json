@@ -1,7 +1,7 @@
 {
   "name": "@votadev/tooncode",
-  "version": "2.2.5",
-  "description": "Free AI Coding Agent CLI — Claude Code alternative powered by free models. 20 tools, multi-agent team, browser automation, MCP servers.",
+  "version": "2.2.6",
+  "description": "🇹🇭 Thai Coding Agent CLI — Claude Code alternative powered by free models. 20 tools, multi-agent team, browser automation, MCP servers.",
   "author": "VotaLab",
   "license": "MIT",
   "keywords": [

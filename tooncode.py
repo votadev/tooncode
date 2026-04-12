@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.5"
+VERSION = "2.2.6"
 
 import httpx
 import json
@@ -4726,7 +4726,7 @@ def print_banner():
     tagline.append("  |  ", style="dim")
     tagline.append(f"v{VERSION}", style="bold #00ccff")
     tagline.append("  |  ", style="dim")
-    tagline.append("Free AI Coding Agent", style="dim white")
+    tagline.append("🇹🇭 Thai Coding Agent", style="dim white")
 
     # Count stats
     install_dir = os.path.dirname(os.path.abspath(__file__))
@@ -5430,7 +5430,7 @@ def _cli():
 
     parser = argparse.ArgumentParser(
         prog="tooncode",
-        description="ToonCode — Free AI Coding Agent CLI by VotaLab",
+        description="ToonCode — 🇹🇭 Thai Coding Agent CLI by VotaLab",
         epilog="""Examples:
   tooncode                     Start interactive mode
   tooncode -m big-pickle       Use specific model

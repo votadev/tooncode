@@ -1,4 +1,4 @@
-# ToonCode — Free AI Coding Agent CLI
+# ToonCode — 🇹🇭 Thai Coding Agent CLI
 
 > **by VotaLab** | v2.0.0 | Claude Code alternative powered by free AI models
 
