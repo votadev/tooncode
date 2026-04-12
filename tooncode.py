@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.3"
+VERSION = "2.3.4"
 
 import httpx
 import json
@@ -3215,6 +3215,9 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
 # Tool Execution with Rich Output
 # ============================================================================
 
+_recent_tool_calls = []  # track last N tool calls to detect loops
+_MAX_SAME_CALL = 2  # max times same tool+args can repeat
+
 def execute_tools(content: list) -> list:
     """Execute all tool calls and return tool results."""
     tool_results = []
@@ -3225,6 +3228,23 @@ def execute_tools(content: list) -> list:
         name = block["name"]
         args = block.get("input", {})
         tool_id = block["id"]
+
+        # Anti-loop: detect same tool call repeating
+        call_sig = f"{name}:{json.dumps(args, sort_keys=True)[:200]}"
+        same_count = sum(1 for c in _recent_tool_calls[-6:] if c == call_sig)
+        _recent_tool_calls.append(call_sig)
+        if len(_recent_tool_calls) > 20:
+            _recent_tool_calls.pop(0)
+
+        if same_count >= _MAX_SAME_CALL:
+            console.print(f"[yellow]Loop detected: {name} called {same_count+1}x with same args — skipping[/yellow]")
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": f"[LOOP DETECTED] You already called {name} with the same arguments {same_count+1} times and it failed. "
+                           f"You MUST try a completely different approach. Read the file first, use a different tool, or ask the user for help.",
+            })
+            continue
 
         handler = TOOL_HANDLERS.get(name)
         if handler:
