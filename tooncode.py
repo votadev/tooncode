@@ -584,13 +584,13 @@ def build_system_prompt() -> str:
 {"- For bash: prefer PowerShell on Windows (Get-Date, Get-ChildItem, Get-Process, etc). NEVER use wmic." if platform.system() == "Windows" else "- For bash: use standard Unix commands (ls, cat, grep, etc)."}
 - For bash: NEVER run interactive commands that wait for input.
 
-# Browser (Playwright)
-You have a `browser` tool that controls a real Chromium browser:
-- `open` a URL, then `text` to read content or `screenshot` to capture
-- `console` to see console.log output, `network` to see requests, `errors` for JS errors
-- `click`/`fill` to interact with pages, `eval` to run JavaScript
-- Browser stays open between calls. Use `close` when done.
-Use this for: testing web apps, scraping data, debugging frontend issues, checking live sites.
+# Browser & Web
+You have a `browser` tool (Playwright) and `web_fetch` tool:
+- On Windows/Mac: use `browser` for full control (open, click, fill, screenshot, console, network)
+- On Linux/headless: prefer `web_fetch` for reading pages (browser may not be available)
+- `browser` auto-falls back to `web_fetch` if Playwright fails
+- For simple page reading, `web_fetch` is faster and lighter than `browser`
+- Use `browser` only when you need: clicking, filling forms, JavaScript, console logs, screenshots
 
 # Sub-agents
 For complex tasks, use `spawn_agent` to delegate work:
@@ -2041,7 +2041,13 @@ def exec_browser(args: dict) -> str:
         console.print("[dim]Starting browser...[/dim]")
         if not _browser_worker.start():
             _browser_worker = None
-            return "[error: could not start browser. Run: playwright install chromium]"
+            # Fallback: use web_fetch instead of Playwright
+            if action == "open" and url:
+                console.print("[yellow]Playwright not available — falling back to web_fetch[/yellow]")
+                return exec_web_fetch({"url": url, "max_length": 20000})
+            elif action == "text" or action == "screenshot":
+                return "[error: browser not available. On Ubuntu run: sudo npx playwright install-deps && npx playwright install chromium]"
+            return "[error: could not start browser]"
 
     if action == "open":
         if not url:
