@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.1.0"
+VERSION = "2.1.2"
 
 import httpx
 import json
@@ -4517,7 +4517,10 @@ OUTPUT THE JSON ARRAY NOW:"""
             else:
                 console.print(f"[bold cyan]Update available: v{current} → v{latest}[/bold cyan]")
                 console.print("[dim]Updating...[/dim]")
-                r2 = subprocess.run("npm install -g @votadev/tooncode",
+                # Clear npm cache for this package first
+                subprocess.run("npm cache clean --force 2>/dev/null",
+                               shell=True, capture_output=True, timeout=15)
+                r2 = subprocess.run("npm install -g @votadev/tooncode@latest",
                                     shell=True, capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=120)
                 if r2.returncode == 0:
@@ -4918,9 +4921,15 @@ def main():
                             tw = 80
                         console.print(Text("─" * tw, style="#333366"))
                         _show_status = False
-                    user_input = session.prompt(
-                        HTML("<prompt>❯ </prompt>"),
-                    ).strip()
+                    try:
+                        user_input = session.prompt(
+                            HTML("<prompt>❯ </prompt>"),
+                        ).strip()
+                    except Exception:
+                        # prompt_toolkit failed (no TTY, termios error, etc.)
+                        # Fallback to basic input permanently
+                        session = None
+                        user_input = input("❯ ").strip()
                 else:
                     if _show_status:
                         print("─" * 60)
