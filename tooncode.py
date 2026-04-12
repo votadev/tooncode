@@ -20,6 +20,7 @@ import glob as glob_mod
 import re
 import platform
 import time
+import hashlib
 import string
 import random
 import threading
@@ -53,6 +54,7 @@ from prompt_toolkit.formatted_text import FormattedText
 
 API_URL = "https://opencode.ai/zen/v1/messages"
 CWD = os.getcwd()
+_worktree_original_cwd = None  # Stored when entering a git worktree via /worktree
 MODEL = "minimax-m2.5-free"
 AVAILABLE_MODELS = ["minimax-m2.5-free", "big-pickle", "nemotron-3-super-free", "gpt-5-nano"]
 def _gen_id(prefix: str, length: int = 24) -> str:
@@ -159,6 +161,378 @@ def _load_skills():
                     }
             except Exception:
                 pass
+
+
+# ============================================================================
+# MCP (Model Context Protocol) Server Support
+# ============================================================================
+
+_mcp_servers: Dict[str, "MCPServer"] = {}  # name -> MCPServer instance
+
+
+class MCPServer:
+    """Manages a single MCP server subprocess communicating via JSON-RPC over stdin/stdout."""
+
+    def __init__(self, name: str, command: str, args: list = None, env: dict = None):
+        self.name = name
+        self.command = command
+        self.args = args or []
+        self.env = env
+        self.process: Optional[subprocess.Popen] = None
+        self.tools: list = []  # discovered tools [{name, description, inputSchema}, ...]
+        self._request_id = 0
+        self._lock = threading.Lock()
+
+    def start(self) -> bool:
+        """Start the MCP server subprocess. Returns True on success."""
+        try:
+            full_env = os.environ.copy()
+            if self.env:
+                full_env.update(self.env)
+            self.process = subprocess.Popen(
+                [self.command] + self.args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=full_env,
+                bufsize=0,
+            )
+            # Initialize the server
+            resp = self._send_request("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "tooncode", "version": VERSION},
+            })
+            if resp is None:
+                self.stop()
+                return False
+            # Send initialized notification (no id, no response expected)
+            self._send_notification("notifications/initialized", {})
+            return True
+        except Exception as e:
+            console.print(f"[error]MCP server '{self.name}' failed to start: {e}[/error]")
+            self.process = None
+            return False
+
+    def stop(self):
+        """Stop the MCP server subprocess."""
+        if self.process:
+            try:
+                self.process.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+            self.process = None
+
+    @property
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def _next_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _send_request(self, method: str, params: dict) -> Optional[dict]:
+        """Send a JSON-RPC request and wait for the response."""
+        if not self.process or not self.is_alive:
+            return None
+        with self._lock:
+            try:
+                req = {
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": method,
+                    "params": params,
+                }
+                raw = json.dumps(req) + "\n"
+                self.process.stdin.write(raw.encode("utf-8"))
+                self.process.stdin.flush()
+
+                # Read response line
+                line = self.process.stdout.readline()
+                if not line:
+                    return None
+                return json.loads(line.decode("utf-8"))
+            except Exception as e:
+                console.print(f"[error]MCP '{self.name}' request error ({method}): {e}[/error]")
+                return None
+
+    def _send_notification(self, method: str, params: dict):
+        """Send a JSON-RPC notification (no id, no response expected)."""
+        if not self.process or not self.is_alive:
+            return
+        try:
+            notif = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            }
+            raw = json.dumps(notif) + "\n"
+            self.process.stdin.write(raw.encode("utf-8"))
+            self.process.stdin.flush()
+        except Exception:
+            pass
+
+    def discover_tools(self) -> list:
+        """Send tools/list request and return discovered tools."""
+        resp = self._send_request("tools/list", {})
+        if resp and "result" in resp:
+            self.tools = resp["result"].get("tools", [])
+        else:
+            self.tools = []
+        return self.tools
+
+    def call_tool(self, tool_name: str, arguments: dict) -> str:
+        """Call a tool on this MCP server. Returns the result as a string."""
+        if not self.is_alive:
+            # Try to restart
+            console.print(f"[dim]MCP server '{self.name}' is down, attempting restart...[/dim]")
+            if not self.start():
+                return f"[MCP error] Server '{self.name}' is not running and failed to restart."
+            self.discover_tools()
+
+        resp = self._send_request("tools/call", {
+            "name": tool_name,
+            "arguments": arguments,
+        })
+        if resp is None:
+            return f"[MCP error] No response from server '{self.name}'."
+        if "error" in resp:
+            err = resp["error"]
+            return f"[MCP error] {err.get('message', str(err))}"
+        result = resp.get("result", {})
+        # MCP tool results have a "content" array with text/image blocks
+        content_parts = result.get("content", [])
+        texts = []
+        for part in content_parts:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                texts.append(part)
+        return "\n".join(texts) if texts else json.dumps(result)
+
+
+def _load_mcp_servers():
+    """Load and start MCP servers from ~/.tooncode/mcp.json.
+
+    Config format:
+        {
+          "servers": {
+            "name": {"command": "...", "args": [...], "env": {...}},
+            ...
+          }
+        }
+    """
+    global _mcp_servers
+    config_path = os.path.join(os.path.expanduser("~"), ".tooncode", "mcp.json")
+    if not os.path.exists(config_path):
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        console.print(f"[error]Failed to read MCP config ({config_path}): {e}[/error]")
+        return
+
+    servers_cfg = config.get("servers", {})
+    if not servers_cfg:
+        return
+
+    for name, cfg in servers_cfg.items():
+        command = cfg.get("command")
+        if not command:
+            console.print(f"[error]MCP server '{name}': missing 'command' in config[/error]")
+            continue
+
+        args = cfg.get("args", [])
+        env = cfg.get("env")
+        server = MCPServer(name, command, args, env)
+
+        if not server.start():
+            continue
+
+        tools = server.discover_tools()
+        _mcp_servers[name] = server
+
+        # Register each discovered tool in TOOLS and TOOL_HANDLERS
+        for tool in tools:
+            tool_name = f"mcp_{name}_{tool['name']}"
+            tool_def = {
+                "name": tool_name,
+                "description": f"[MCP:{name}] {tool.get('description', tool['name'])}",
+                "input_schema": tool.get("inputSchema", {"type": "object", "properties": {}}),
+            }
+            TOOLS.append(tool_def)
+
+            # Capture variables for closure
+            _srv_name = name
+            _tool_original_name = tool["name"]
+            TOOL_HANDLERS[tool_name] = lambda args, sn=_srv_name, tn=_tool_original_name: _call_mcp_tool(sn, tn, args)
+
+    total_tools = sum(len(s.tools) for s in _mcp_servers.values())
+    if _mcp_servers:
+        console.print(f"[dim]  MCP: {len(_mcp_servers)} server(s) started, {total_tools} tool(s) discovered[/dim]")
+
+
+def _call_mcp_tool(server_name: str, tool_name: str, arguments: dict) -> str:
+    """Forward a tool call to the appropriate MCP server."""
+    server = _mcp_servers.get(server_name)
+    if not server:
+        return f"[MCP error] Server '{server_name}' not found."
+    return server.call_tool(tool_name, arguments)
+
+
+def _shutdown_mcp_servers():
+    """Stop all MCP server subprocesses."""
+    for name, server in _mcp_servers.items():
+        try:
+            server.stop()
+        except Exception:
+            pass
+    _mcp_servers.clear()
+
+
+# Codebase index
+_codebase_index = ""  # formatted string of project structure + symbols
+
+_INDEX_SKIP_DIRS = {"node_modules", "__pycache__", ".git", "venv", ".venv", "env",
+                    "dist", "build", ".next", ".tox", ".mypy_cache", ".pytest_cache",
+                    "coverage", ".svn", "vendor", "target"}
+_INDEX_SKIP_EXTS = {".pyc", ".pyo", ".min.js", ".min.css", ".map", ".lock",
+                    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".bmp", ".webp",
+                    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv",
+                    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+                    ".exe", ".dll", ".so", ".dylib", ".o", ".a",
+                    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+                    ".db", ".sqlite", ".sqlite3", ".jar", ".class",
+                    ".pdf", ".doc", ".docx", ".xls", ".xlsx"}
+_SYMBOL_RE = re.compile(
+    r'^\s*(?:'
+    r'(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+(\w+)'
+    r'|(?:export\s+)?(?:const|let|var)\s+(\w+)\s*='
+    r'|(?:export\s+default\s+(?:class|function)\s+(\w+))'
+    r'|(?:interface|type|enum)\s+(\w+)'
+    r')',
+    re.MULTILINE
+)
+
+
+def _get_index_cache_path() -> str:
+    """Return cache file path for current CWD's index."""
+    cache_dir = os.path.join(os.path.expanduser("~"), ".tooncode", "index_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cwd_hash = hashlib.md5(CWD.encode()).hexdigest()[:12]
+    return os.path.join(cache_dir, f"{cwd_hash}.txt")
+
+
+def _build_codebase_index(directory: str = None) -> str:
+    """Scan project directory and build a concise index of files and symbols."""
+    global _codebase_index
+    if directory is None:
+        directory = CWD
+
+    files_by_ext = {}
+    symbols_by_file = {}
+    total_files = 0
+    max_files = 500
+
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in _INDEX_SKIP_DIRS and not d.startswith(".")]
+        rel_root = os.path.relpath(root, directory)
+
+        for fname in files:
+            if total_files >= max_files:
+                break
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in _INDEX_SKIP_EXTS:
+                continue
+
+            rel_path = os.path.join(rel_root, fname) if rel_root != "." else fname
+            rel_path = rel_path.replace("\\", "/")
+            total_files += 1
+            files_by_ext.setdefault(ext or "(no ext)", []).append(rel_path)
+
+            if ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".go", ".rs", ".java", ".rb", ".php"):
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read(50000)
+                    syms = []
+                    for m in _SYMBOL_RE.finditer(content):
+                        sym = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+                        if sym and sym not in syms:
+                            syms.append(sym)
+                    if syms:
+                        symbols_by_file[rel_path] = syms
+                except Exception:
+                    pass
+        if total_files >= max_files:
+            break
+
+    lines = [f"Project: {os.path.basename(directory)} ({total_files} files)"]
+    type_summary = sorted(files_by_ext.items(), key=lambda x: -len(x[1]))
+    lines.append("Types: " + ", ".join(f"{ext}:{len(p)}" for ext, p in type_summary[:15]))
+
+    top_files = [p for paths in files_by_ext.values() for p in paths if "/" not in p]
+    if top_files:
+        lines.append("Root: " + ", ".join(sorted(top_files)[:20]))
+
+    top_dirs = set()
+    for paths in files_by_ext.values():
+        for p in paths:
+            parts = p.split("/")
+            if len(parts) > 1:
+                top_dirs.add(parts[0])
+                if len(parts) > 2:
+                    top_dirs.add(parts[0] + "/" + parts[1])
+    if top_dirs:
+        lines.append("Dirs: " + ", ".join(sorted(top_dirs)[:30]))
+
+    lines.append("")
+    lines.append("Symbols:")
+    remaining = 2000 - sum(len(l) + 1 for l in lines)
+    for fpath, syms in sorted(symbols_by_file.items()):
+        entry = f"  {fpath}: {', '.join(syms[:15])}"
+        if len(entry) > remaining:
+            lines.append("  ... (truncated)")
+            break
+        lines.append(entry)
+        remaining -= len(entry) + 1
+
+    result = "\n".join(lines)
+    _codebase_index = result
+
+    try:
+        cache_path = _get_index_cache_path()
+        with open(cache_path, "w", encoding="utf-8") as f:
+            f.write(result)
+    except Exception:
+        pass
+
+    return result
+
+
+def _load_cached_index() -> bool:
+    """Load index from cache if it exists. Returns True if loaded."""
+    global _codebase_index
+    try:
+        cache_path = _get_index_cache_path()
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                _codebase_index = f.read()
+            return True
+    except Exception:
+        pass
+    return False
+
 
 # Context window sizes per model
 CONTEXT_WINDOWS = {
@@ -296,6 +670,10 @@ You are in PLAN MODE. You must ONLY:
             if len(ctx) > 3000:
                 ctx = ctx[:3000] + "\n... (truncated)"
             prompt += f"\n\n## From {fname}\n{ctx}"
+
+    # Codebase index — gives AI awareness of project structure without glob/grep
+    if _codebase_index:
+        prompt += f"\n\n# Codebase Index\nPre-scanned project structure and symbols (use /index to refresh):\n```\n{_codebase_index}\n```"
 
     # Auto-load recent memories (last 3)
     memory_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory")
@@ -861,6 +1239,55 @@ def _show_diff(old_text: str, new_text: str, filename: str):
         ))
 
 
+def _auto_lint(filepath: str) -> str:
+    """Run a quick syntax/error check on the given file after edit. Returns lint output or empty string."""
+    import shutil
+    ext = os.path.splitext(filepath)[1].lower()
+    cmds: list[list[str]] = []
+
+    if ext == ".py":
+        cmds.append([sys.executable, "-m", "py_compile", filepath])
+        if shutil.which("ruff"):
+            # errors only, no style warnings
+            cmds.append(["ruff", "check", "--select=E9,F63,F7,F82", "--no-fix", filepath])
+    elif ext in (".js", ".ts", ".jsx", ".tsx"):
+        if shutil.which("npx"):
+            cmds.append(["npx", "--no-install", "eslint", "--quiet", filepath])
+        elif ext == ".js" and shutil.which("node"):
+            cmds.append(["node", "--check", filepath])
+    elif ext == ".json":
+        cmds.append([sys.executable, "-m", "json.tool", filepath])
+    # .html/.htm/.css — skip (too noisy or no reliable quick linter)
+
+    if not cmds:
+        return ""
+
+    results: list[str] = []
+    for cmd in cmds:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            # For json.tool, success means valid JSON — don't echo the formatted output
+            if ext == ".json" and proc.returncode == 0:
+                continue
+            output = (proc.stdout.strip() + "\n" + proc.stderr.strip()).strip()
+            if proc.returncode != 0 and output:
+                results.append(output)
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            pass  # linter not installed, timed out, or other error — don't block
+
+    if results:
+        lint_text = "\n".join(results)
+        if len(lint_text) > 2000:
+            lint_text = lint_text[:2000] + "\n... (truncated)"
+        return f"\n[lint errors]\n{lint_text}"
+    return ""
+
+
 def exec_write(args: dict) -> str:
     fpath = args.get("filePath", "")
     content = args.get("content", "")
@@ -887,7 +1314,8 @@ def exec_write(args: dict) -> str:
             console.print(f"[bold green]+ Created {fpath} ({lines} lines)[/bold green]")
         else:
             _show_diff(old_content, content, fpath)
-        return f"Successfully wrote {lines} lines to {fpath}"
+        lint_out = _auto_lint(fpath)
+        return f"Successfully wrote {lines} lines to {fpath}" + lint_out
     except Exception as e:
         return f"[error: {e}]"
 
@@ -917,7 +1345,8 @@ def exec_edit(args: dict) -> str:
             f.write(new_content)
         replaced = count if replace_all else 1
         _show_diff(content, new_content, fpath)
-        return f"Replaced {replaced} occurrence(s) in {fpath}"
+        lint_out = _auto_lint(fpath)
+        return f"Replaced {replaced} occurrence(s) in {fpath}" + lint_out
     except Exception as e:
         return f"[error: {e}]"
 
@@ -945,7 +1374,8 @@ def exec_multi_edit(args: dict) -> str:
         with open(fpath, "w", encoding="utf-8", newline="\n") as f:
             f.write(content)
         _show_diff(original, content, fpath)
-        return f"Applied {applied} edit(s) to {fpath}"
+        lint_out = _auto_lint(fpath)
+        return f"Applied {applied} edit(s) to {fpath}" + lint_out
     except Exception as e:
         return f"[error: {e}]"
 
@@ -3014,7 +3444,7 @@ def _load_session(filepath: str) -> Optional[list]:
 
 def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
     """Handle slash commands. Returns True if handled, None to quit, False if not a command."""
-    global MODEL, CWD, plan_mode, _task_counter
+    global MODEL, CWD, plan_mode, _task_counter, _worktree_original_cwd
 
     parts = cmd.strip().split(None, 1)
     command = parts[0].lower()
@@ -3358,6 +3788,16 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         })
         return True
 
+    elif command == "/index":
+        console.print("[info]Indexing codebase...[/info]")
+        t0 = time.time()
+        result = _build_codebase_index()
+        elapsed = time.time() - t0
+        n_lines = result.count("\n") + 1
+        console.print(f"[info]Index built in {elapsed:.1f}s ({n_lines} lines, {len(result)} chars). Cached to ~/.tooncode/index_cache/[/info]")
+        console.print(Panel(result, title="Codebase Index", border_style="cyan", expand=False))
+        return True
+
     elif command == "/clear":
         messages.clear()
         console.print("[info]Conversation cleared.[/info]")
@@ -3384,12 +3824,16 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         help_table.add_row("/commit [msg]", "Git add all & commit")
         help_table.add_row("/diff", "Git diff")
         help_table.add_row("/status", "Git status")
+        help_table.add_row("/worktree <name>", "Create git worktree & switch to it")
+        help_table.add_row("/worktree list", "List existing git worktrees")
+        help_table.add_row("/worktree done", "Merge back & remove worktree")
         help_table.add_row("/undo", "Undo last file edit")
         help_table.add_row("/bg, /ps", "List background processes (kill/logs)")
         help_table.add_row("/team <task>", "Start multi-agent team (planner+frontend+backend+...)")
         help_table.add_row("/send <msg>", "Send message to other ToonCode windows")
         help_table.add_row("/send", "Read messages from other windows")
 
+        help_table.add_row("/index", "Rebuild codebase index (files + symbols)")
         help_table.add_row("/init", "Create TOONCODE.md project memory")
         help_table.add_row("/config", "Show/edit config (~/.tooncode/config.json)")
         help_table.add_row("/clear", "Clear conversation history")
@@ -3842,6 +4286,101 @@ OUTPUT THE JSON ARRAY NOW:"""
         console.print(f"[info]{result.stdout.strip()}[/info]")
         return True
 
+    elif command == "/worktree":
+        if not arg:
+            console.print("[error]Usage: /worktree <name> | /worktree list | /worktree done[/error]")
+            return True
+
+        if arg == "list":
+            result = subprocess.run(
+                "git worktree list", shell=True, capture_output=True, text=True,
+                cwd=CWD, encoding="utf-8", errors="replace",
+            )
+            output = result.stdout.strip() or "(no worktrees)"
+            console.print(f"[info]{output}[/info]")
+            return True
+
+        if arg == "done":
+            if not _worktree_original_cwd:
+                console.print("[error]Not currently in a worktree session.[/error]")
+                return True
+
+            # Check for uncommitted changes
+            status_result = subprocess.run(
+                "git status --porcelain", shell=True, capture_output=True, text=True,
+                cwd=CWD, encoding="utf-8", errors="replace",
+            )
+            if status_result.stdout.strip():
+                console.print("[warn]Uncommitted changes detected. Committing before merge...[/warn]")
+                subprocess.run(
+                    'git add -A && git commit -m "worktree: auto-commit before merge"',
+                    shell=True, capture_output=True, text=True,
+                    cwd=CWD, encoding="utf-8", errors="replace",
+                )
+
+            # Get current branch name to merge from
+            branch_result = subprocess.run(
+                "git rev-parse --abbrev-ref HEAD", shell=True, capture_output=True, text=True,
+                cwd=CWD, encoding="utf-8", errors="replace",
+            )
+            worktree_branch = branch_result.stdout.strip()
+            worktree_path = CWD
+
+            # Switch back to original directory
+            CWD = _worktree_original_cwd
+            _worktree_original_cwd = None
+            os.chdir(CWD)
+
+            # Merge the worktree branch
+            if worktree_branch:
+                merge_result = subprocess.run(
+                    f"git merge {worktree_branch}", shell=True, capture_output=True, text=True,
+                    cwd=CWD, encoding="utf-8", errors="replace",
+                )
+                merge_output = (merge_result.stdout + merge_result.stderr).strip()
+                if merge_result.returncode == 0:
+                    console.print(f"[info]Merged branch '{worktree_branch}' successfully.[/info]")
+                else:
+                    console.print(f"[error]Merge failed: {merge_output}[/error]")
+                    console.print("[info]You may need to resolve conflicts manually.[/info]")
+
+            # Remove the worktree
+            remove_result = subprocess.run(
+                f"git worktree remove {worktree_path}", shell=True, capture_output=True, text=True,
+                cwd=CWD, encoding="utf-8", errors="replace",
+            )
+            if remove_result.returncode == 0:
+                console.print(f"[info]Removed worktree at {worktree_path}[/info]")
+            else:
+                err = (remove_result.stdout + remove_result.stderr).strip()
+                console.print(f"[error]Failed to remove worktree: {err}[/error]")
+
+            console.print(f"[info]Back in original directory: {CWD}[/info]")
+            return True
+
+        # /worktree <name> — create a new worktree
+        name = arg.strip()
+        parent_dir = os.path.dirname(CWD)
+        worktree_path = os.path.join(parent_dir, f"{name}-worktree")
+
+        result = subprocess.run(
+            f"git worktree add {worktree_path} -b {name}",
+            shell=True, capture_output=True, text=True,
+            cwd=CWD, encoding="utf-8", errors="replace",
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode != 0:
+            console.print(f"[error]{output}[/error]")
+            return True
+
+        _worktree_original_cwd = CWD
+        CWD = worktree_path
+        os.chdir(CWD)
+        console.print(f"[info]{output}[/info]")
+        console.print(f"[info]Now working in isolated branch '{name}' at {worktree_path}[/info]")
+        console.print("[info]Use /worktree done to merge back and clean up.[/info]")
+        return True
+
     elif command == "/undo":
         if not _edit_history:
             console.print("[info]Nothing to undo.[/info]")
@@ -4065,6 +4604,13 @@ def print_banner():
         badges.append(" ", style="on #009966")
         badges.append(f" {skill_count} skills ", style="bold white on #009966")
         badges.append(" ", style="dim")
+    # MCP badge
+    mcp_count = len(_mcp_servers) if _mcp_servers else 0
+    if mcp_count > 0:
+        mcp_tools = sum(len(s.tools) for s in _mcp_servers.values())
+        badges.append(" ", style="on #cc3399")
+        badges.append(f" MCP:{mcp_count} ({mcp_tools} tools) ", style="bold white on #cc3399")
+        badges.append(" ", style="dim")
     # Git badge
     if has_git:
         badges.append(" ", style="on #cc6600")
@@ -4147,6 +4693,9 @@ def main():
     if _skills:
         console.print(f"[dim]  Loaded {len(_skills)} skill(s): {', '.join('/' + s for s in _skills)}[/dim]")
 
+    # Load MCP servers from ~/.tooncode/mcp.json
+    _load_mcp_servers()
+
     # Auto-detect project context files
     _other_mds = ["CLAUDE.md", ".claude/CLAUDE.md", "GEMINI.md", ".cursorrules", ".cursor/rules",
                   "COPILOT.md", ".github/copilot-instructions.md"]
@@ -4161,6 +4710,15 @@ def main():
         console.print(f"[bold cyan]  Found: {', '.join(found_others)} — importing to TOONCODE.md...[/bold cyan]")
         # Auto-create TOONCODE.md with imported content
         handle_slash_command("/init", [])
+
+    # Auto-index codebase on first start (load from cache or build fresh)
+    if not _load_cached_index():
+        console.print("[dim]  Indexing codebase...[/dim]", end="")
+        _build_codebase_index()
+        console.print(f"[dim] done ({_codebase_index.count(chr(10)) + 1} lines)[/dim]")
+    else:
+        console.print(f"[dim]  Loaded codebase index from cache (use /index to refresh)[/dim]")
+
     console.print()
 
     messages = []
@@ -4688,3 +5246,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         console.print("\n[dim]Goodbye![/dim]")
+    finally:
+        _shutdown_mcp_servers()
