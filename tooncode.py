@@ -3862,6 +3862,7 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         help_table.add_row("/skills", "List loaded skills from SKILLS.md")
         help_table.add_row("!command", "Run shell command directly (e.g. !git log)")
         help_table.add_row("/help", "Show this help message")
+        help_table.add_row("/update", "Check & install latest version")
         help_table.add_row("/quit, /exit", "Exit ToonCode")
         console.print(help_table)
         return True
@@ -4498,6 +4499,36 @@ OUTPUT THE JSON ARRAY NOW:"""
             console.print(f"[dim]  Auto-detected project info[/dim]")
         return True
 
+    elif command == "/update":
+        console.print("[dim]Checking for updates...[/dim]")
+        try:
+            # Check latest version on npm
+            r = subprocess.run("npm view @votadev/tooncode version",
+                               shell=True, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=15)
+            latest = r.stdout.strip()
+            if not latest:
+                console.print("[yellow]Could not check npm registry.[/yellow]")
+                return True
+
+            current = VERSION
+            if latest == current:
+                console.print(f"[green]Already up to date (v{current})[/green]")
+            else:
+                console.print(f"[bold cyan]Update available: v{current} → v{latest}[/bold cyan]")
+                console.print("[dim]Updating...[/dim]")
+                r2 = subprocess.run("npm install -g @votadev/tooncode",
+                                    shell=True, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=120)
+                if r2.returncode == 0:
+                    console.print(f"[bold green]Updated to v{latest}! Restart tooncode to use new version.[/bold green]")
+                else:
+                    console.print(f"[error]Update failed: {r2.stderr[:200]}[/error]")
+                    console.print("[dim]Try manually: npm install -g @votadev/tooncode[/dim]")
+        except Exception as e:
+            console.print(f"[error]Update check failed: {e}[/error]")
+        return True
+
     elif command == "/config":
         config_dir = os.path.join(os.path.expanduser("~"), ".tooncode")
         config_path = os.path.join(config_dir, "config.json")
@@ -4713,7 +4744,20 @@ def main():
     print_banner()
     _load_skills()
     if _skills:
-        console.print(f"[dim]  Loaded {len(_skills)} skill(s): {', '.join('/' + s for s in _skills)}[/dim]")
+        console.print(f"[dim]  {len(_skills)} skills loaded (/skills to list)[/dim]")
+
+    # Check for updates in background (non-blocking)
+    def _check_update():
+        try:
+            r = subprocess.run("npm view @votadev/tooncode version",
+                               shell=True, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=10)
+            latest = r.stdout.strip()
+            if latest and latest != VERSION:
+                console.print(f"[bold cyan]  Update available: v{VERSION} → v{latest} (/update to install)[/bold cyan]")
+        except Exception:
+            pass
+    threading.Thread(target=_check_update, daemon=True).start()
 
     # Load MCP servers from ~/.tooncode/mcp.json
     _load_mcp_servers()
@@ -4957,7 +5001,8 @@ def main():
 
                     if skill_name in _skills:
                         skill = _skills[skill_name]
-                        console.print(f"[bold magenta]Running skill: /{skill_name}[/bold magenta]")
+                        desc = skill.get("description", "")
+                        console.print(f"[bold magenta]/{skill_name}[/bold magenta] [dim]— {desc}[/dim]")
                         prompt = skill["prompt"]
                         if skill_arg:
                             prompt = prompt.replace("{{input}}", skill_arg)
