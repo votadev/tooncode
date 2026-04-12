@@ -1977,12 +1977,14 @@ class _BrowserWorker:
 
     def execute(self, fn, timeout=30):
         """Run a function on the browser thread and return result."""
+        if not self._thread or not self._thread.is_alive():
+            return "[browser error: browser was closed externally. It will auto-restart on next call.]"
         holder = {"result": None, "done": threading.Event()}
         self._cmd_queue.append((fn, holder))
         self._cmd_event.set()
         if holder["done"].wait(timeout=timeout):
             return holder["result"]
-        return "[browser error: timeout]"
+        return "[browser error: timeout — browser may have been closed]"
 
     def close(self):
         self._stop = True
@@ -2029,7 +2031,11 @@ def exec_browser(args: dict) -> str:
             return "(no JS errors captured)"
         return f"Page errors ({len(_browser_errors)}):\n" + "\n".join(_browser_errors[-20:])
 
-    # Start browser if needed
+    # Start browser if needed / detect if closed externally
+    if _browser_worker and not _browser_worker._thread.is_alive():
+        console.print("[yellow]Browser was closed. Restarting...[/yellow]")
+        _browser_worker = None
+
     if not _browser_worker:
         _browser_worker = _BrowserWorker()
         console.print("[dim]Starting browser...[/dim]")
@@ -2496,7 +2502,8 @@ class StreamRenderer:
     def stop(self):
         """Stop the live display and print final formatted output."""
         if self._live:
-            # Stop live display first (clears the streaming output)
+            # Clear live display by setting empty content, then stop
+            self._live.update(Text(""))
             self._live.stop()
             self._live = None
             # Now print the final output with proper Markdown rendering
