@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.2"
+VERSION = "2.3.3"
 
 import httpx
 import json
@@ -652,8 +652,12 @@ def build_system_prompt() -> str:
 - Batch independent tool calls in one response for speed.
 {"- For bash on Windows: use PowerShell cmdlets ONLY. NEVER use Unix commands (grep, sed, awk, head, tail, curl|grep, mkdir -p). Use web_fetch instead of curl. Use Get-ChildItem instead of ls. NEVER use wmic." if platform.system() == "Windows" else "- For bash: use standard Unix commands (ls, cat, grep, etc)."}
 - For bash: NEVER run interactive commands that wait for input.
-- If a bash command fails, try a DIFFERENT approach. Do NOT retry the same command more than once.
+- ANTI-LOOP RULE: If ANY tool fails, you MUST try a DIFFERENT approach. NEVER retry the exact same tool call.
+  - bash fails? → try different command or use a dedicated tool instead
+  - edit oldString not found? → READ the file first, then use the exact text from the file
+  - web_fetch fails? → try web_search or browser instead
 - To read web pages: use `web_fetch` tool (NOT curl). To search: use `web_search` tool.
+- Before editing a file, ALWAYS read it first to see the exact content.
 
 # Browser & Web
 You have a `browser` tool (Playwright) and `web_fetch` tool:
@@ -1414,7 +1418,12 @@ def exec_edit(args: dict) -> str:
             _edit_history.pop(0)
         count = content.count(old)
         if count == 0:
-            return "[error: oldString not found in file]"
+            # Show actual file content so AI can see what's really there
+            lines = content.split("\n")
+            preview = "\n".join(f"{i+1}: {l}" for i, l in enumerate(lines[:30]))
+            if len(lines) > 30:
+                preview += f"\n... ({len(lines)} total lines)"
+            return f"[error: oldString not found in file. Read the file first!]\n\nActual file content:\n{preview}"
         if count > 1 and not replace_all:
             return f"[error: found {count} matches, but replaceAll is false. Provide more context or set replaceAll=true]"
         if replace_all:
