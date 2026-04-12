@@ -8,6 +8,10 @@ build/
 *.egg
 .env
 logs/
-screenshots/
-memory/
-sessions/
+screenshots/*
+memory/*
+sessions/*
+!screenshots/.gitkeep
+!memory/.gitkeep
+!sessions/.gitkeep
+task-tracker.html
