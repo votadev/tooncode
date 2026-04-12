@@ -1090,10 +1090,10 @@ def exec_bash(args: dict) -> str:
     cmd = args.get("command", "")
     workdir = args.get("workdir", CWD)
     try:
-        timeout_ms = float(args.get("timeout", 120000))
+        timeout_ms = float(args.get("timeout", 300000))
     except (ValueError, TypeError):
-        timeout_ms = 120000
-    timeout_s = max(1, min(timeout_ms / 1000, 600))  # clamp 1s-600s
+        timeout_ms = 300000
+    timeout_s = max(1, min(timeout_ms / 1000, 1800))  # clamp 1s-30min
     background = args.get("background", False)
 
     # Check if command needs permission
@@ -1126,7 +1126,8 @@ def exec_bash(args: dict) -> str:
             output += f"\n[exit code: {result.returncode}]"
         return output[:50000] or "(no output)"
     except subprocess.TimeoutExpired:
-        return f"[command timed out after {timeout_s}s - consider adding background:true for long-running commands]"
+        console.print(f"[yellow]Command timed out after {timeout_s:.0f}s — restarting in background...[/yellow]")
+        return _exec_bash_background(cmd, workdir)
     except Exception as e:
         return f"[error: {e}]"
 
@@ -2872,7 +2873,7 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
     body = _sanitize(body)
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0, read=120.0)) as client:
+        with httpx.Client(timeout=httpx.Timeout(300.0, connect=15.0, read=300.0)) as client:
             with client.stream("POST", API_URL, headers=headers, json=body) as resp:
                 if resp.status_code != 200:
                     err = resp.read().decode(errors="replace")
