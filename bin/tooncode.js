@@ -16,54 +16,86 @@ function findPython() {
   return null;
 }
 
-function checkDeps(python) {
+function getVenvPython() {
+  const venvDir = path.join(__dirname, "..", ".venv");
+  return process.platform === "win32"
+    ? path.join(venvDir, "Scripts", "python.exe")
+    : path.join(venvDir, "bin", "python");
+}
+
+function checkDeps(py) {
   try {
-    execSync(`${python} -c "import httpx, rich, prompt_toolkit" 2>&1`, { encoding: "utf-8" });
+    execSync(`"${py}" -c "import httpx, rich, prompt_toolkit" 2>&1`, { encoding: "utf-8" });
     return true;
   } catch { return false; }
 }
 
-function installDeps(python) {
-  const req = path.join(__dirname, "..", "requirements.txt");
-  const cmds = [
-    `${python} -m pip install --user --quiet --break-system-packages -r "${req}"`,
-    `${python} -m pip install --user --quiet -r "${req}"`,
-    `${python} -m pip install --quiet -r "${req}"`,
-    `pip3 install --user --quiet --break-system-packages -r "${req}"`,
-    `pip3 install --user --quiet -r "${req}"`,
-    `pip3 install --quiet -r "${req}"`,
-  ];
-  console.log(`${D}Installing dependencies...${X}`);
-  for (const cmd of cmds) {
-    try {
-      execSync(cmd, { stdio: ["ignore", "pipe", "pipe"], timeout: 120000 });
-      return true;
-    } catch {}
+function ensureVenv(sysPython) {
+  const venvDir = path.join(__dirname, "..", ".venv");
+  const venvPy = getVenvPython();
+  if (!fs.existsSync(venvPy)) {
+    console.log(`${C}Creating virtual environment...${X}`);
+    execSync(`${sysPython} -m venv "${venvDir}"`, { stdio: "pipe", timeout: 60000 });
   }
-  return false;
+  return venvPy;
 }
 
-// Find Python
-const python = findPython();
-if (!python) {
+function installDeps(py) {
+  const req = path.join(__dirname, "..", "requirements.txt");
+  console.log(`${D}Installing dependencies...${X}`);
+  execSync(`"${py}" -m pip install --quiet -r "${req}"`, {
+    stdio: ["ignore", "pipe", "pipe"], timeout: 120000
+  });
+}
+
+// Find system Python
+const sysPython = findPython();
+if (!sysPython) {
   console.error(`${R}Python 3.10+ required. Install: https://python.org${X}`);
   process.exit(1);
 }
 
-// Check & install deps
-if (!checkDeps(python)) {
-  console.log(`${C}First run — installing Python dependencies...${X}`);
-  if (!installDeps(python)) {
-    console.error(`${R}Could not install dependencies. Run manually:${X}`);
-    console.error(`${C}  ${python} -m pip install httpx rich prompt_toolkit${X}`);
-    process.exit(1);
+// Determine which Python to use (prefer venv)
+let usePython;
+const venvPy = getVenvPython();
+
+if (fs.existsSync(venvPy) && checkDeps(venvPy)) {
+  // venv exists and has deps
+  usePython = venvPy;
+} else if (checkDeps(sysPython)) {
+  // system Python has deps
+  usePython = sysPython;
+} else {
+  // Need to install — try venv first
+  console.log(`${C}First run — setting up...${X}`);
+  try {
+    const vp = ensureVenv(sysPython);
+    installDeps(vp);
+    usePython = vp;
+    console.log(`${G}Ready.${X}\n`);
+  } catch {
+    // venv failed, try system pip
+    const fallbacks = [
+      `${sysPython} -m pip install --user --quiet --break-system-packages -r "${path.join(__dirname, "..", "requirements.txt")}"`,
+      `${sysPython} -m pip install --user --quiet -r "${path.join(__dirname, "..", "requirements.txt")}"`,
+    ];
+    let ok = false;
+    for (const cmd of fallbacks) {
+      try { execSync(cmd, { stdio: ["ignore", "pipe", "pipe"], timeout: 120000 }); ok = true; break; } catch {}
+    }
+    if (ok) {
+      usePython = sysPython;
+    } else {
+      console.error(`${R}Could not install dependencies.${X}`);
+      console.error(`${C}  ${sysPython} -m pip install httpx rich prompt_toolkit${X}`);
+      process.exit(1);
+    }
   }
-  console.log(`${G}Dependencies ready.${X}\n`);
 }
 
 // Run tooncode
 const mainPy = path.join(__dirname, "..", "tooncode.py");
-const child = spawn(python, [mainPy, ...process.argv.slice(2)], {
+const child = spawn(usePython, [mainPy, ...process.argv.slice(2)], {
   stdio: "inherit",
   cwd: process.cwd(),
   env: { ...process.env, PYTHONIOENCODING: "utf-8" },
