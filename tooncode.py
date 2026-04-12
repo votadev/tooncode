@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.3"
+VERSION = "2.2.5"
 
 import httpx
 import json
@@ -2915,9 +2915,39 @@ def _get_current_api_url() -> str:
     return _get_api_url()
 
 
+def _validate_messages(messages: list):
+    """Fix message ordering issues before sending to API."""
+    # Rule: tool_result must follow assistant with tool_use
+    # Rule: alternating user/assistant (with tool_result counting as user)
+    fixed = []
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "")
+        # Skip empty messages
+        content = msg.get("content", [])
+        if not content:
+            continue
+        # Prevent consecutive same-role messages (except tool_result after user)
+        if fixed:
+            prev_role = fixed[-1].get("role", "")
+            if role == prev_role and role == "user":
+                # Check if this is tool_result (allowed after tool_use response)
+                is_tool_result = isinstance(content, list) and any(
+                    b.get("type") == "tool_result" for b in content if isinstance(b, dict))
+                if not is_tool_result:
+                    fixed.append({"role": "assistant", "content": [{"type": "text", "text": "(continuing)"}]})
+            elif role == prev_role and role == "assistant":
+                fixed.append({"role": "user", "content": [{"type": "text", "text": "(continue)"}]})
+        fixed.append(msg)
+    messages.clear()
+    messages.extend(fixed)
+
+
 def stream_response(messages: list, renderer: StreamRenderer) -> dict:
     """Send request and stream the response, returning parsed content blocks."""
     global total_input_tokens, total_output_tokens, last_input_tokens
+
+    # Validate message ordering
+    _validate_messages(messages)
 
     system_prompt = build_system_prompt()
     body = {
@@ -3285,7 +3315,7 @@ Be specific. Give copy-paste ready solutions."""
         console.print("[bold magenta][bosshelp] Asking Claude Code...[/bold magenta]")
         try:
             result = subprocess.run(
-                [claude_cmd, "--print"],
+                [claude_cmd, "--print", "--dangerously-skip-permissions"],
                 input=help_prompt,
                 capture_output=True, text=True, cwd=CWD, timeout=180,
                 encoding="utf-8", errors="replace",
@@ -4197,7 +4227,7 @@ OUTPUT THE JSON ARRAY NOW:"""
                 console.print("[dim]Using Claude Code CLI...[/dim]")
                 try:
                     result = subprocess.run(
-                        [claude_cmd, "--print"],
+                        [claude_cmd, "--print", "--dangerously-skip-permissions"],
                         input=boss_prompt,
                         capture_output=True, text=True, cwd=CWD, timeout=180,
                         encoding="utf-8", errors="replace",
@@ -5312,21 +5342,21 @@ def main(_initial_prompt=None):
                                     )
                                     _last_errors.clear()
                                     _post_bosshelp = True
-                                    # Inject boss answer as a separate user message after tool results
+                                    # MUST append tool_results first (API requires it after tool_use)
                                     messages.append({"role": "user", "content": tool_results})
-                                    messages.append({"role": "assistant", "content": [{"type": "text", "text": "I'm stuck. Let me check the boss's advice."}]})
-                                    # Parse boss answer for file paths and code blocks
-                                    fix_instructions = f"[BOSSHELP - APPLY NOW]\n{boss_answer}\n\n"
-                                    fix_instructions += "STEP-BY-STEP INSTRUCTIONS:\n"
-                                    fix_instructions += "1. Read each file mentioned above using the read tool\n"
-                                    fix_instructions += "2. Apply each code change using the edit tool (oldString → newString)\n"
-                                    fix_instructions += "3. If the fix says to run a command, use the bash tool\n"
-                                    fix_instructions += "4. After applying, verify with bash (e.g. python -c 'import module')\n"
-                                    fix_instructions += "\nDo NOT explain. Do NOT repeat failed approach. USE TOOLS NOW."
+                                    # Then add bosshelp as assistant+user pair
+                                    fix_instructions = f"[BOSSHELP]\n{boss_answer}\n\n"
+                                    fix_instructions += "APPLY THIS FIX NOW:\n"
+                                    fix_instructions += "1. Read each file mentioned\n"
+                                    fix_instructions += "2. Use edit tool to apply changes\n"
+                                    fix_instructions += "3. Run commands if needed\n"
+                                    fix_instructions += "4. Verify the fix works\n"
+                                    fix_instructions += "USE TOOLS. Do NOT explain."
+                                    messages.append({"role": "assistant", "content": [{"type": "text", "text": "Let me apply the fix."}]})
                                     messages.append({"role": "user", "content": [{"type": "text", "text":
                                         fix_instructions,
                                         "cache_control": {"type": "ephemeral"}}]})
-                                    continue  # Skip the normal append below
+                                    continue
                         else:
                             # Successful tool = reset error tracking
                             _last_errors.clear()
