@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 import httpx
 import json
@@ -5384,51 +5384,6 @@ def main(_initial_prompt=None):
                 if has_tool_use(content):
                     console.print()
                     tool_results = execute_tools(content)
-
-                    # -- Stuck detection: if same error repeats, auto-call bosshelp --
-                    for tr in tool_results:
-                        tr_content = tr.get("content", "")
-                        if isinstance(tr_content, str) and ("[error" in tr_content or "exit code" in tr_content):
-                            _last_errors.append(tr_content[:200])
-                            # If 3+ errors in recent tools, we're stuck
-                            if len(_last_errors) >= 3:
-                                recent = _last_errors[-3:]
-                                # Check if errors are similar (stuck in loop)
-                                if len(set(recent)) <= 2:
-                                    console.print("\n[bold magenta][auto-bosshelp] Stuck detected! Asking Claude Code for help...[/bold magenta]")
-                                    # Gather context
-                                    recent_text = "\n".join(
-                                        block.get("text", "")
-                                        for msg in messages[-4:]
-                                        if msg.get("role") == "assistant"
-                                        for block in (msg.get("content") if isinstance(msg.get("content"), list) else [])
-                                        if block.get("type") == "text"
-                                    )
-                                    boss_answer = _boss_help(
-                                        problem=f"I keep getting the same error and can't fix it",
-                                        context=recent_text[:1000],
-                                        error="\n".join(recent),
-                                    )
-                                    _last_errors.clear()
-                                    _post_bosshelp = True
-                                    # MUST append tool_results first (API requires it after tool_use)
-                                    messages.append({"role": "user", "content": tool_results})
-                                    # Then add bosshelp as assistant+user pair
-                                    fix_instructions = f"[BOSSHELP]\n{boss_answer}\n\n"
-                                    fix_instructions += "APPLY THIS FIX NOW:\n"
-                                    fix_instructions += "1. Read each file mentioned\n"
-                                    fix_instructions += "2. Use edit tool to apply changes\n"
-                                    fix_instructions += "3. Run commands if needed\n"
-                                    fix_instructions += "4. Verify the fix works\n"
-                                    fix_instructions += "USE TOOLS. Do NOT explain."
-                                    messages.append({"role": "assistant", "content": [{"type": "text", "text": "Let me apply the fix."}]})
-                                    messages.append({"role": "user", "content": [{"type": "text", "text":
-                                        fix_instructions,
-                                        "cache_control": {"type": "ephemeral"}}]})
-                                    continue
-                        else:
-                            # Successful tool = reset error tracking
-                            _last_errors.clear()
 
                     messages.append({"role": "user", "content": tool_results})
                     continue  # Always continue after tool use
