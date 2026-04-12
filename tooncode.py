@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.1.2"
+VERSION = "2.2.0"
 
 import httpx
 import json
@@ -57,11 +57,59 @@ except ImportError as e:
 # Configuration
 # ============================================================================
 
-API_URL = "https://opencode.ai/zen/v1/messages"
 CWD = os.getcwd()
-_worktree_original_cwd = None  # Stored when entering a git worktree via /worktree
-MODEL = "minimax-m2.5-free"
-AVAILABLE_MODELS = ["minimax-m2.5-free", "big-pickle", "nemotron-3-super-free", "gpt-5-nano"]
+_worktree_original_cwd = None
+
+# Default settings — overridden by ~/.tooncode/settings.json
+_DEFAULT_SETTINGS = {
+    "api_url": "https://opencode.ai/zen/v1/messages",
+    "default_model": "minimax-m2.5-free",
+    "models": [
+        {"name": "minimax-m2.5-free", "context": 204800},
+        {"name": "big-pickle", "context": 200000, "no_sampling": True},
+        {"name": "nemotron-3-super-free", "context": 131072},
+        {"name": "gpt-5-nano", "context": 1047576, "no_sampling": True},
+    ],
+    "auto_approve": True,
+    "theme": "default",
+}
+
+def _load_settings() -> dict:
+    """Load settings from ~/.tooncode/settings.json, merge with defaults."""
+    settings = dict(_DEFAULT_SETTINGS)
+    settings_path = os.path.join(os.path.expanduser("~"), ".tooncode", "settings.json")
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            # Merge: user overrides defaults
+            for k, v in user.items():
+                if k == "models" and isinstance(v, list):
+                    # Append user models to defaults (no duplicates)
+                    existing = {m["name"] for m in settings["models"]}
+                    for m in v:
+                        if isinstance(m, dict) and m.get("name") and m["name"] not in existing:
+                            settings["models"].append(m)
+                            existing.add(m["name"])
+                else:
+                    settings[k] = v
+        except Exception:
+            pass
+    return settings
+
+def _save_settings(settings: dict):
+    """Save settings to ~/.tooncode/settings.json."""
+    settings_dir = os.path.join(os.path.expanduser("~"), ".tooncode")
+    os.makedirs(settings_dir, exist_ok=True)
+    settings_path = os.path.join(settings_dir, "settings.json")
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+
+# Load settings
+_settings = _load_settings()
+API_URL = _settings["api_url"]
+MODEL = _settings["default_model"]
+AVAILABLE_MODELS = [m["name"] for m in _settings["models"]]
 def _gen_id(prefix: str, length: int = 24) -> str:
     """Generate IDs matching OpenCode format: prefix + hex + mixed alphanumeric."""
     chars = string.ascii_letters + string.digits
@@ -540,15 +588,9 @@ def _load_cached_index() -> bool:
 
 
 # Context window sizes per model
-CONTEXT_WINDOWS = {
-    "minimax-m2.5-free": 204_800,
-    "big-pickle": 200_000,
-    "nemotron-3-super-free": 131_072,
-    "gpt-5-nano": 1_047_576,
-}
-
-# Models that should NOT get temperature/top_k/top_p params
-NO_SAMPLING_PARAMS = {"big-pickle", "gpt-5-nano"}
+# Build from settings
+CONTEXT_WINDOWS = {m["name"]: m.get("context", 200_000) for m in _settings["models"]}
+NO_SAMPLING_PARAMS = {m["name"] for m in _settings["models"] if m.get("no_sampling")}
 
 
 # ============================================================================
@@ -4733,7 +4775,7 @@ def print_banner():
     console.print()
 
 
-def main():
+def main(_initial_prompt=None):
     global MODEL, CWD, message_count
 
     # Fix Windows encoding for Thai/Unicode
@@ -4884,6 +4926,7 @@ def main():
     _last_channel_check = 0
     _my_pid = os.getpid()
     _seen_msgs = set()
+    _injected_prompt = _initial_prompt  # for -p flag
 
     while True:
         try:
@@ -4911,37 +4954,41 @@ def main():
                         except Exception:
                             pass
 
-            # Get input — Claude Code style: separator + prompt + toolbar
-            try:
-                if session:
-                    if _show_status:
+            # Injected prompt from -p flag
+            if _injected_prompt:
+                user_input = _injected_prompt
+                _injected_prompt = None
+                console.print(f"[dim]> {user_input[:100]}[/dim]")
+            else:
+                # Get input
+                try:
+                    if session:
+                        if _show_status:
+                            try:
+                                tw = os.get_terminal_size().columns
+                            except Exception:
+                                tw = 80
+                            console.print(Text("─" * tw, style="#333366"))
+                            _show_status = False
                         try:
-                            tw = os.get_terminal_size().columns
+                            user_input = session.prompt(
+                                HTML("<prompt>❯ </prompt>"),
+                            ).strip()
                         except Exception:
-                            tw = 80
-                        console.print(Text("─" * tw, style="#333366"))
-                        _show_status = False
-                    try:
-                        user_input = session.prompt(
-                            HTML("<prompt>❯ </prompt>"),
-                        ).strip()
-                    except Exception:
-                        # prompt_toolkit failed (no TTY, termios error, etc.)
-                        # Fallback to basic input permanently
-                        session = None
+                            session = None
+                            user_input = input("❯ ").strip()
+                    else:
+                        if _show_status:
+                            print("─" * 60)
+                            _show_status = False
                         user_input = input("❯ ").strip()
-                else:
-                    if _show_status:
-                        print("─" * 60)
-                        _show_status = False
-                    user_input = input("❯ ").strip()
-            except KeyboardInterrupt:
-                console.print("\n[dim]Ctrl+C again to exit.[/dim]")
-                _show_status = True
-                continue
-            except EOFError:
-                console.print("\n[dim]Goodbye![/dim]")
-                break
+                except KeyboardInterrupt:
+                    console.print("\n[dim]Ctrl+C again to exit.[/dim]")
+                    _show_status = True
+                    continue
+                except EOFError:
+                    console.print("\n[dim]Goodbye![/dim]")
+                    break
 
             # Handle Ctrl+C signal from prompt_toolkit
             if user_input == "__CTRL_C__":
@@ -5303,23 +5350,87 @@ def main():
             continue
 
 
-if __name__ == "__main__":
-    # Accept model as CLI argument
-    if len(sys.argv) > 1:
-        if sys.argv[1] in AVAILABLE_MODELS:
-            MODEL = sys.argv[1]
-        else:
-            print(f"Unknown model: {sys.argv[1]}")
-            print(f"Available: {', '.join(AVAILABLE_MODELS)}")
-            sys.exit(1)
+def _cli():
+    """Parse CLI arguments."""
+    global MODEL, CWD
+    import argparse
 
-    # Accept CWD as second argument
-    if len(sys.argv) > 2:
-        if os.path.isdir(sys.argv[2]):
-            CWD = os.path.abspath(sys.argv[2])
+    parser = argparse.ArgumentParser(
+        prog="tooncode",
+        description="ToonCode — Free AI Coding Agent CLI by VotaLab",
+        epilog="""Examples:
+  tooncode                     Start interactive mode
+  tooncode -m big-pickle       Use specific model
+  tooncode -C ~/project        Start in specific directory
+  tooncode -p "fix the bug"    Run a prompt and exit
+  tooncode --models            List available models
+  tooncode --update            Update to latest version
+
+Settings: ~/.tooncode/settings.json
+  Add/remove models, change defaults, set API URL.
+  Example settings.json:
+  {
+    "default_model": "big-pickle",
+    "models": [
+      {"name": "my-custom-model", "context": 128000},
+      {"name": "local-llama", "context": 32000, "no_sampling": true}
+    ],
+    "api_url": "https://opencode.ai/zen/v1/messages",
+    "auto_approve": true
+  }
+
+More info: https://www.npmjs.com/package/@votadev/tooncode""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"tooncode {VERSION}")
+    parser.add_argument("-m", "--model", choices=AVAILABLE_MODELS, help="AI model to use")
+    parser.add_argument("-C", "--cwd", metavar="DIR", help="Working directory")
+    parser.add_argument("-p", "--prompt", metavar="TEXT", help="Run a single prompt and exit")
+    parser.add_argument("--models", action="store_true", help="List available models")
+    parser.add_argument("--update", action="store_true", help="Update to latest version")
+    # Legacy positional args (backward compat)
+    parser.add_argument("legacy_model", nargs="?", help=argparse.SUPPRESS)
+    parser.add_argument("legacy_cwd", nargs="?", help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    # --models
+    if args.models:
+        print("Available models:")
+        for m in AVAILABLE_MODELS:
+            marker = " (default)" if m == MODEL else ""
+            print(f"  {m}{marker}")
+        sys.exit(0)
+
+    # --update
+    if args.update:
+        os.system("npm install -g @votadev/tooncode@latest")
+        sys.exit(0)
+
+    # Model
+    if args.model:
+        MODEL = args.model
+    elif args.legacy_model and args.legacy_model in AVAILABLE_MODELS:
+        MODEL = args.legacy_model
+
+    # CWD
+    if args.cwd and os.path.isdir(args.cwd):
+        CWD = os.path.abspath(args.cwd)
+    elif args.legacy_cwd and os.path.isdir(args.legacy_cwd):
+        CWD = os.path.abspath(args.legacy_cwd)
+
+    return args
+
+
+if __name__ == "__main__":
+    args = _cli()
 
     try:
-        main()
+        if args.prompt:
+            # Single prompt mode: run one prompt and exit (for piping/scripting)
+            main(_initial_prompt=args.prompt)
+        else:
+            main()
     except KeyboardInterrupt:
         console.print("\n[dim]Goodbye![/dim]")
     finally:
