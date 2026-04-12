@@ -1,0 +1,32 @@
+{
+  "name": "tooncode",
+  "version": "2.0.0",
+  "description": "Free AI Coding Agent CLI — Claude Code alternative powered by free models. 20 tools, multi-agent team, browser automation, MCP servers.",
+  "author": "VotaLab",
+  "license": "MIT",
+  "keywords": ["ai", "coding", "agent", "cli", "claude", "free", "tooncode", "copilot", "cursor"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/votalab/tooncode"
+  },
+  "homepage": "https://github.com/votalab/tooncode#readme",
+  "bin": {
+    "tooncode": "./bin/tooncode.js"
+  },
+  "files": [
+    "bin/",
+    "tooncode.py",
+    "__main__.py",
+    "skills/",
+    "requirements.txt",
+    "setup.py",
+    "tooncode.cmd",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node bin/postinstall.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
