@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.7"
+VERSION = "2.2.8"
 
 import httpx
 import json
@@ -3350,21 +3350,58 @@ Be specific. Give copy-paste ready solutions."""
 
         with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
             resp = client.post(_get_current_api_url(), headers=make_request_headers(), json=body)
-            if resp.status_code == 200:
-                data = resp.json()
-                answer = ""
-                for block in data.get("content", []):
-                    if block.get("type") == "text":
-                        answer += block.get("text", "")
-                if answer:
-                    console.print(Panel(
-                        Text(answer[:500] + ("..." if len(answer) > 500 else ""), style="dim"),
-                        title=f"[bold magenta]Boss Answer ({MODEL})[/bold magenta]",
-                        border_style="magenta",
-                    ))
-                    return answer
+            if resp.status_code != 200:
+                err_text = resp.text[:300]
+                console.print(f"[error]Boss API error ({resp.status_code}): {err_text}[/error]")
+                # Try other models as fallback
+                for fallback_model in AVAILABLE_MODELS:
+                    if fallback_model == MODEL:
+                        continue
+                    console.print(f"[dim]Trying {fallback_model}...[/dim]")
+                    body["model"] = fallback_model
+                    if fallback_model in NO_SAMPLING_PARAMS:
+                        body.pop("temperature", None)
+                        body.pop("top_k", None)
+                        body.pop("top_p", None)
+                    try:
+                        # Use that model's endpoint if it has one
+                        mcfg = _get_model_config(fallback_model)
+                        fb_url = mcfg.get("api_url", _get_current_api_url())
+                        fb_headers = dict(make_request_headers())
+                        if mcfg.get("api_key"):
+                            fb_headers["x-api-key"] = mcfg["api_key"]
+                        resp2 = client.post(fb_url, headers=fb_headers, json=body)
+                        if resp2.status_code == 200:
+                            data2 = resp2.json()
+                            for block in data2.get("content", []):
+                                if block.get("type") == "text" and block.get("text"):
+                                    answer = block["text"]
+                                    console.print(Panel(
+                                        Text(answer[:500] + ("..." if len(answer) > 500 else ""), style="dim"),
+                                        title=f"[bold magenta]Boss Answer ({fallback_model})[/bold magenta]",
+                                        border_style="magenta",
+                                    ))
+                                    return answer
+                    except Exception:
+                        continue
+                return "[bosshelp: all models failed]"
+
+            data = resp.json()
+            answer = ""
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    answer += block.get("text", "")
+            if answer:
+                console.print(Panel(
+                    Text(answer[:500] + ("..." if len(answer) > 500 else ""), style="dim"),
+                    title=f"[bold magenta]Boss Answer ({MODEL})[/bold magenta]",
+                    border_style="magenta",
+                ))
+                return answer
+            else:
+                console.print("[yellow]Boss returned empty response[/yellow]")
     except Exception as e:
-        console.print(f"[error]Fallback also failed: {e}[/error]")
+        console.print(f"[error]Boss fallback error: {e}[/error]")
 
     return "[bosshelp: all methods failed]"
 
