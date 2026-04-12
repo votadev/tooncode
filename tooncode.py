@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 import httpx
 import json
@@ -63,6 +63,7 @@ _worktree_original_cwd = None
 # Default settings — overridden by ~/.tooncode/settings.json
 _DEFAULT_SETTINGS = {
     "api_url": "https://opencode.ai/zen/v1/messages",
+    "api_key": "public",
     "default_model": "minimax-m2.5-free",
     "models": [
         {"name": "minimax-m2.5-free", "context": 204800},
@@ -73,6 +74,8 @@ _DEFAULT_SETTINGS = {
     "auto_approve": True,
     "theme": "default",
 }
+# Per-model settings example in settings.json:
+# {"name": "claude-sonnet", "context": 200000, "api_url": "https://api.anthropic.com/v1/messages", "api_key": "sk-ant-..."}
 
 def _load_settings() -> dict:
     """Load settings from ~/.tooncode/settings.json, merge with defaults."""
@@ -108,8 +111,26 @@ def _save_settings(settings: dict):
 # Load settings
 _settings = _load_settings()
 API_URL = _settings["api_url"]
+API_KEY = _settings.get("api_key", "public")
 MODEL = _settings["default_model"]
 AVAILABLE_MODELS = [m["name"] for m in _settings["models"]]
+
+def _get_model_config(model_name: str) -> dict:
+    """Get per-model config (api_url, api_key, context, etc.)"""
+    for m in _settings["models"]:
+        if m["name"] == model_name:
+            return m
+    return {}
+
+def _get_api_url() -> str:
+    """Get API URL for current model (per-model or global)."""
+    cfg = _get_model_config(MODEL)
+    return cfg.get("api_url", API_URL)
+
+def _get_api_key() -> str:
+    """Get API key for current model (per-model or global)."""
+    cfg = _get_model_config(MODEL)
+    return cfg.get("api_key", API_KEY)
 def _gen_id(prefix: str, length: int = 24) -> str:
     """Generate IDs matching OpenCode format: prefix + hex + mixed alphanumeric."""
     chars = string.ascii_letters + string.digits
@@ -124,7 +145,7 @@ HEADERS = {
     "User-Agent": "ai-sdk/anthropic/3.0.67 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.11",
     "anthropic-beta": "fine-grained-tool-streaming-2025-05-14",
     "anthropic-version": "2023-06-01",
-    "x-api-key": "public",
+    "x-api-key": API_KEY,
     "x-opencode-client": "desktop",
     "x-opencode-project": "global",
     "Connection": "keep-alive",
@@ -2225,7 +2246,7 @@ You are a sub-agent. Complete the task and report your result concisely."""
                 body["top_p"] = 0.95
 
             with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-                resp = client.post(API_URL, headers=headers, json=body)
+                resp = client.post(_get_current_api_url(), headers=headers, json=body)
                 if resp.status_code != 200:
                     return f"[agent error: HTTP {resp.status_code}]"
                 data = resp.json()
@@ -2388,7 +2409,7 @@ CHANNEL PROTOCOL:
                 body["top_p"] = 0.95
 
             with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-                resp = client.post(API_URL, headers=headers, json=body)
+                resp = client.post(_get_current_api_url(), headers=headers, json=body)
                 if resp.status_code != 200:
                     break
                 data = resp.json()
@@ -2870,11 +2891,22 @@ class StreamRenderer:
 
 def make_request_headers() -> dict:
     msg_id = _gen_id("msg", 24)
-    return {
+    h = {
         **HEADERS,
+        "x-api-key": _get_api_key(),
         "x-opencode-request": msg_id,
         "x-opencode-session": SESSION_ID,
     }
+    # If using a real API key (not "public"), also set Authorization header
+    key = _get_api_key()
+    if key and key != "public":
+        h["x-api-key"] = key
+        h["Authorization"] = f"Bearer {key}" if not key.startswith("sk-ant-") else f"x-api-key {key}"
+    return h
+
+def _get_current_api_url() -> str:
+    """Get API URL for current request."""
+    return _get_api_url()
 
 
 def stream_response(messages: list, renderer: StreamRenderer) -> dict:
@@ -2916,7 +2948,7 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
 
     try:
         with httpx.Client(timeout=httpx.Timeout(300.0, connect=15.0, read=300.0)) as client:
-            with client.stream("POST", API_URL, headers=headers, json=body) as resp:
+            with client.stream("POST", _get_current_api_url(), headers=headers, json=body) as resp:
                 if resp.status_code != 200:
                     err = resp.read().decode(errors="replace")
                     console.print(f"[error]API Error ({resp.status_code}): {err[:500]}[/error]")
@@ -3281,7 +3313,7 @@ Be specific. Give copy-paste ready solutions."""
             body["top_p"] = 0.95
 
         with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
-            resp = client.post(API_URL, headers=make_request_headers(), json=body)
+            resp = client.post(_get_current_api_url(), headers=make_request_headers(), json=body)
             if resp.status_code == 200:
                 data = resp.json()
                 answer = ""
@@ -3341,7 +3373,7 @@ def _do_autocompact(messages: list):
     continue_task = ""
     try:
         with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
-            resp = client.post(API_URL, headers=make_request_headers(), json=compact_body)
+            resp = client.post(_get_current_api_url(), headers=make_request_headers(), json=compact_body)
             if resp.status_code == 200:
                 data = resp.json()
                 for block in data.get("content", []):
@@ -3950,7 +3982,7 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         console.print("[info]Compacting conversation...[/info]")
         try:
             with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
-                resp = client.post(API_URL, headers=make_request_headers(), json=compact_body)
+                resp = client.post(_get_current_api_url(), headers=make_request_headers(), json=compact_body)
                 if resp.status_code == 200:
                     data = resp.json()
                     summary = ""
@@ -4116,7 +4148,7 @@ Read {{input}} and generate clear documentation with examples.
         expanded_task = arg  # fallback to original
         try:
             with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
-                resp = client.post(API_URL, headers=make_request_headers(), json=expand_body)
+                resp = client.post(_get_current_api_url(), headers=make_request_headers(), json=expand_body)
                 if resp.status_code == 200:
                     data = resp.json()
                     for block in data.get("content", []):
@@ -4183,7 +4215,7 @@ OUTPUT THE JSON ARRAY NOW:"""
                     body["top_k"] = 40
                     body["top_p"] = 0.95
                 with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
-                    resp = client.post(API_URL, headers=make_request_headers(), json=body)
+                    resp = client.post(_get_current_api_url(), headers=make_request_headers(), json=body)
                     if resp.status_code == 200:
                         data = resp.json()
                         for block in data.get("content", []):
