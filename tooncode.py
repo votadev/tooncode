@@ -3059,6 +3059,65 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
             console.print("[info]Usage: /bg [kill <id|all>] [logs <id>][/info]")
             return True
 
+    elif command in ("/send", "/chat"):
+        # Send message to other ToonCode instances via shared channel
+        channel_dir = os.path.join(os.path.expanduser("~"), ".tooncode", "channels")
+        os.makedirs(channel_dir, exist_ok=True)
+
+        if not arg:
+            # Read messages
+            inbox = sorted(glob_mod.glob(os.path.join(channel_dir, "*.json")), key=os.path.getmtime, reverse=True)
+            if not inbox:
+                console.print("[info]No messages. Use /send <message> to send.[/info]")
+                return True
+            console.print("[bold cyan]Channel Messages:[/bold cyan]")
+            for mf in inbox[:10]:
+                try:
+                    with open(mf, "r", encoding="utf-8") as f:
+                        msg = json.load(f)
+                    age = time.time() - msg.get("time", 0)
+                    age_str = f"{int(age)}s ago" if age < 60 else f"{int(age/60)}m ago" if age < 3600 else f"{int(age/3600)}h ago"
+                    sender = msg.get("from", "?")
+                    text = msg.get("text", "")
+                    console.print(f"  [bold cyan]{sender}[/bold cyan] [dim]({age_str})[/dim]: {text[:100]}")
+                except Exception:
+                    pass
+            console.print(f"\n[info]/send <msg> to reply | /send clear to delete all[/info]")
+            return True
+
+        if arg == "clear":
+            for f in glob_mod.glob(os.path.join(channel_dir, "*.json")):
+                os.remove(f)
+            console.print("[info]Channel cleared.[/info]")
+            return True
+
+        # Send message
+        instance_id = f"tooncode-{os.getpid()}"
+        msg_data = {
+            "from": instance_id,
+            "text": arg,
+            "time": time.time(),
+            "cwd": CWD,
+            "model": MODEL,
+        }
+        msg_file = os.path.join(channel_dir, f"{int(time.time()*1000)}_{os.getpid()}.json")
+        with open(msg_file, "w", encoding="utf-8") as f:
+            json.dump(msg_data, f, ensure_ascii=False)
+        console.print(f"[bold cyan]Sent to channel:[/bold cyan] {arg[:100]}")
+
+        # Also inject into conversation so AI knows about it
+        messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text":
+                f"[Channel message sent to other ToonCode instances]: {arg}",
+                "cache_control": {"type": "ephemeral"}}],
+        })
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Message sent to channel."}],
+        })
+        return True
+
     elif command == "/clear":
         messages.clear()
         console.print("[info]Conversation cleared.[/info]")
@@ -3087,6 +3146,8 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         help_table.add_row("/status", "Git status")
         help_table.add_row("/undo", "Undo last file edit")
         help_table.add_row("/bg, /ps", "List background processes (kill/logs)")
+        help_table.add_row("/send <msg>", "Send message to other ToonCode windows")
+        help_table.add_row("/send", "Read messages from other windows")
 
         help_table.add_row("/init", "Create TOONCODE.md project memory")
         help_table.add_row("/config", "Show/edit config (~/.tooncode/config.json)")
@@ -3952,9 +4013,36 @@ def main():
         session = None
 
     _show_status = True  # only show status bar before real input
+    _last_channel_check = 0
+    _my_pid = os.getpid()
+    _seen_msgs = set()
 
     while True:
         try:
+            # Check channel for new messages from other instances
+            now = time.time()
+            if now - _last_channel_check > 3:  # check every 3 seconds
+                _last_channel_check = now
+                ch_dir = os.path.join(os.path.expanduser("~"), ".tooncode", "channels")
+                if os.path.exists(ch_dir):
+                    for mf in glob_mod.glob(os.path.join(ch_dir, "*.json")):
+                        if mf in _seen_msgs:
+                            continue
+                        _seen_msgs.add(mf)
+                        try:
+                            with open(mf, "r", encoding="utf-8") as f:
+                                msg = json.load(f)
+                            # Skip own messages
+                            if str(_my_pid) in msg.get("from", ""):
+                                continue
+                            # Only show recent (< 30s old)
+                            if now - msg.get("time", 0) < 30:
+                                sender = msg.get("from", "?")
+                                text = msg.get("text", "")
+                                console.print(f"\n[bold magenta]  >> {sender}:[/bold magenta] {text[:150]}")
+                        except Exception:
+                            pass
+
             # Get input — Claude Code style: separator + prompt + toolbar
             try:
                 if session:
