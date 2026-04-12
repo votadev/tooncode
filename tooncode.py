@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.2.8"
+VERSION = "2.2.9"
 
 import httpx
 import json
@@ -4980,6 +4980,10 @@ def main(_initial_prompt=None):
             @kb.add("c-d")
             def _(event):
                 raise EOFError()
+
+            @kb.add("escape", "escape")
+            def _(event):
+                event.current_buffer.reset()
 
             def _bottom_toolbar():
                 """Claude Code-style bottom toolbar."""
