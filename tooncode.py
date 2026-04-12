@@ -202,7 +202,7 @@ def build_system_prompt() -> str:
 
 # Tool usage
 - Batch independent tool calls in one response for speed.
-- For bash: prefer PowerShell on Windows (Get-Date, Get-ChildItem, Get-Process, etc). NEVER use wmic.
+{"- For bash: prefer PowerShell on Windows (Get-Date, Get-ChildItem, Get-Process, etc). NEVER use wmic." if platform.system() == "Windows" else "- For bash: use standard Unix commands (ls, cat, grep, etc)."}
 - For bash: NEVER run interactive commands that wait for input.
 
 # Browser (Playwright)
@@ -227,7 +227,7 @@ You are powered by {MODEL}.
   Working directory: {CWD}
   Platform: {platform.system()} ({platform.platform()})
   Today's date: {datetime.now().strftime('%a %b %d %Y')}
-  Shell: powershell (Windows) — use PowerShell cmdlets, NOT cmd.exe commands
+  Shell: {'powershell — use PowerShell cmdlets, NOT cmd.exe/wmic' if platform.system() == 'Windows' else 'bash'}
 </env>
 
 # Web research
@@ -1365,56 +1365,78 @@ def exec_screenshot(args: dict) -> str:
     filepath = os.path.join(ss_dir, f"desktop_{ts}.png")
 
     try:
-        from PIL import ImageGrab
+        img = None
+        _sys = platform.system()
 
-        if window_title and platform.system() == "Windows":
-            # Try to capture specific window
+        # Linux: use scrot or gnome-screenshot
+        if _sys == "Linux":
+            for tool in ["scrot", "gnome-screenshot", "maim"]:
+                try:
+                    if tool == "gnome-screenshot":
+                        subprocess.run(["gnome-screenshot", "-f", filepath], timeout=10, check=True)
+                    else:
+                        subprocess.run([tool, filepath], timeout=10, check=True)
+                    from PIL import Image
+                    img = Image.open(filepath)
+                    break
+                except (FileNotFoundError, subprocess.CalledProcessError):
+                    continue
+            if img is None:
+                return "[error: install scrot or gnome-screenshot for Linux screenshots]"
+
+        # macOS: use screencapture
+        elif _sys == "Darwin":
             try:
-                import ctypes
-                from ctypes import wintypes
+                subprocess.run(["screencapture", "-x", filepath], timeout=10, check=True)
+                from PIL import Image
+                img = Image.open(filepath)
+            except Exception as e:
+                return f"[error: macOS screenshot failed: {e}]"
 
-                user32 = ctypes.windll.user32
-
-                # Find window by title (partial match)
-                found_hwnd = None
-                def _enum_cb(hwnd, _):
-                    nonlocal found_hwnd
-                    length = user32.GetWindowTextLengthW(hwnd)
-                    if length > 0:
-                        buf = ctypes.create_unicode_buffer(length + 1)
-                        user32.GetWindowTextW(hwnd, buf, length + 1)
-                        if window_title.lower() in buf.value.lower():
-                            if user32.IsWindowVisible(hwnd):
-                                found_hwnd = hwnd
-                                return False  # stop enum
-                    return True
-
-                WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
-                user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
-
-                if found_hwnd:
-                    rect = wintypes.RECT()
-                    user32.GetWindowRect(found_hwnd, ctypes.byref(rect))
-                    bbox = (rect.left, rect.top, rect.right, rect.bottom)
-                    img = ImageGrab.grab(bbox=bbox)
-                else:
-                    img = ImageGrab.grab()
-                    filepath = filepath.replace("desktop_", "fullscreen_")
-            except Exception:
-                img = ImageGrab.grab()
-        elif region != "full" and "," in region:
-            # Parse region: x,y,w,h
-            try:
-                parts = [int(p.strip()) for p in region.split(",")]
-                if len(parts) == 4:
-                    x, y, w, h = parts
-                    img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-                else:
-                    img = ImageGrab.grab()
-            except ValueError:
-                img = ImageGrab.grab()
+        # Windows: use PIL ImageGrab
         else:
-            img = ImageGrab.grab()
+            from PIL import ImageGrab
+
+            if window_title:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    user32 = ctypes.windll.user32
+                    found_hwnd = None
+                    def _enum_cb(hwnd, _):
+                        nonlocal found_hwnd
+                        length = user32.GetWindowTextLengthW(hwnd)
+                        if length > 0:
+                            buf = ctypes.create_unicode_buffer(length + 1)
+                            user32.GetWindowTextW(hwnd, buf, length + 1)
+                            if window_title.lower() in buf.value.lower():
+                                if user32.IsWindowVisible(hwnd):
+                                    found_hwnd = hwnd
+                                    return False
+                        return True
+                    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+                    user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+                    if found_hwnd:
+                        rect = wintypes.RECT()
+                        user32.GetWindowRect(found_hwnd, ctypes.byref(rect))
+                        bbox = (rect.left, rect.top, rect.right, rect.bottom)
+                        img = ImageGrab.grab(bbox=bbox)
+                    else:
+                        img = ImageGrab.grab()
+                except Exception:
+                    img = ImageGrab.grab()
+            elif region != "full" and "," in region:
+                try:
+                    parts_r = [int(p.strip()) for p in region.split(",")]
+                    if len(parts_r) == 4:
+                        x, y, w, h = parts_r
+                        img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+                    else:
+                        img = ImageGrab.grab()
+                except ValueError:
+                    img = ImageGrab.grab()
+            else:
+                img = ImageGrab.grab()
 
         img.save(filepath)
         width, height = img.size
