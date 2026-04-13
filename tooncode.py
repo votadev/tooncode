@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.5.4"
+VERSION = "2.5.5"
 
 import httpx
 import json
@@ -78,11 +78,11 @@ _DEFAULT_SETTINGS = {
     "api_provider": "",  # "" = default (opencode), "puter" = Puter.com
     "puter_token": "",
     "puter_models": [
-        {"name": "openai/gpt-5-nano", "context": 1047576},
-        {"name": "openai/gpt-5.4", "context": 1047576},
         {"name": "google/gemini-2.5-flash", "context": 1048576},
+        {"name": "openai/gpt-5-nano", "context": 1047576},
         {"name": "deepseek/deepseek-v3.2", "context": 131072},
         {"name": "mistralai/devstral-2512", "context": 131072},
+        {"name": "openai/gpt-5.4", "context": 1047576},
     ],
 }
 # Per-model settings example in settings.json:
@@ -142,7 +142,7 @@ if _settings.get("api_provider", "").lower() == "puter":
             _seen.add(m["name"])
     _settings["models"] = _deduped
     if _settings.get("default_model", "minimax-m2.5-free") == "minimax-m2.5-free":
-        _settings["default_model"] = "openai/gpt-5-nano"
+        _settings["default_model"] = "google/gemini-2.5-flash"
 
 MODEL = _settings["default_model"]
 AVAILABLE_MODELS = [m["name"] for m in _settings["models"]]
@@ -7337,7 +7337,7 @@ Settings: ~/.tooncode/settings.json
   {
     "api_provider": "puter",
     "puter_token": "YOUR_PUTER_TOKEN",
-    "default_model": "openai/gpt-5-nano",
+    "default_model": "google/gemini-2.5-flash",
     "auto_approve": true
   }
   Get token: sign up at https://puter.com -> Developer Console -> puter.authToken
