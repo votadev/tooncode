@@ -1,6 +1,6 @@
 # ToonCode — 🇹🇭 Thai Coding Agent CLI
 
-> **by VotaLab** | v2.6.0 | Thai AI Coding Agent powered by free AI models
+> **by VotaLab** | v2.6.1 | Thai AI Coding Agent powered by free AI models
 
 ```
   ████████╗ ██████╗  ██████╗ ███╗   ██╗ ██████╗ ██████╗ ██████╗ ███████╗
