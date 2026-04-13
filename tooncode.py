@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.9"
+VERSION = "2.4.0"
 
 import httpx
 import json
@@ -24,6 +24,8 @@ import hashlib
 import string
 import random
 import threading
+import atexit
+import signal
 from datetime import datetime
 from typing import Optional, Dict
 
@@ -182,6 +184,7 @@ message_count = 0
 
 # Edit history for /undo
 _edit_history = []  # max 50 entries, trimmed on append
+_edit_history_lock = threading.Lock()
 _MAX_EDIT_HISTORY = 50
 
 # Plan mode
@@ -189,6 +192,7 @@ plan_mode = False  # When True, AI plans only (no writes/edits)
 
 # Task system
 _tasks = []  # [{"id": 1, "text": "...", "status": "pending"|"in_progress"|"done"}, ...]
+_tasks_lock = threading.Lock()
 _task_counter = 0
 
 # Skills system
@@ -1054,6 +1058,7 @@ TOOLS = [
 
 # Background processes tracking
 _bg_processes: Dict[str, subprocess.Popen] = {}
+_bg_processes_lock = threading.Lock()
 
 # Commands that should auto-run in background
 _BG_PATTERNS = [
@@ -1274,8 +1279,9 @@ def _exec_bash_background(cmd: str, workdir: str) -> str:
         except Exception:
             output = "(server started, output not captured)"
 
-        bg_id = f"bg_{len(_bg_processes)+1}"
-        _bg_processes[bg_id] = proc
+        with _bg_processes_lock:
+            bg_id = f"bg_{len(_bg_processes)+1}"
+            _bg_processes[bg_id] = proc
 
         return (
             f"[background] Server started (PID: {proc.pid}, ID: {bg_id})\n"
@@ -1409,9 +1415,10 @@ def exec_write(args: dict) -> str:
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
                     old_content = f.read()
-                _edit_history.append({"filePath": fpath, "content": old_content})
-                if len(_edit_history) > _MAX_EDIT_HISTORY:
-                    _edit_history.pop(0)
+                with _edit_history_lock:
+                    _edit_history.append({"filePath": fpath, "content": old_content})
+                    if len(_edit_history) > _MAX_EDIT_HISTORY:
+                        _edit_history.pop(0)
             except Exception:
                 pass
         with open(fpath, "w", encoding="utf-8", newline="\n") as f:
@@ -1436,9 +1443,10 @@ def exec_edit(args: dict) -> str:
         with open(fpath, "r", encoding="utf-8") as f:
             content = f.read()
         # Save for /undo
-        _edit_history.append({"filePath": fpath, "content": content})
-        if len(_edit_history) > _MAX_EDIT_HISTORY:
-            _edit_history.pop(0)
+        with _edit_history_lock:
+            _edit_history.append({"filePath": fpath, "content": content})
+            if len(_edit_history) > _MAX_EDIT_HISTORY:
+                _edit_history.pop(0)
         count = content.count(old)
         if count == 0:
             # Show actual file content so AI can see what's really there
@@ -1472,9 +1480,10 @@ def exec_multi_edit(args: dict) -> str:
         with open(fpath, "r", encoding="utf-8") as f:
             content = f.read()
         original = content
-        _edit_history.append({"filePath": fpath, "content": content})
-        if len(_edit_history) > _MAX_EDIT_HISTORY:
-            _edit_history.pop(0)
+        with _edit_history_lock:
+            _edit_history.append({"filePath": fpath, "content": content})
+            if len(_edit_history) > _MAX_EDIT_HISTORY:
+                _edit_history.pop(0)
         applied = 0
         for i, edit in enumerate(edits):
             old = edit.get("oldString", "")
@@ -2014,12 +2023,11 @@ _browser_console_logs = []
 _browser_requests = []
 _browser_errors = []
 _MAX_BROWSER_LOGS = 200
-_browser_thread = None
 _browser_lock = threading.Lock()
 
 # Browser runs in a dedicated thread to avoid asyncio event loop conflicts
 class _BrowserWorker:
-    """Runs Playwright in a dedicated thread to avoid event loop conflicts with prompt_toolkit."""
+    """Robust Playwright browser worker with auto-install, headless support, and proper cleanup."""
 
     def __init__(self):
         self._thread = None
@@ -2027,33 +2035,69 @@ class _BrowserWorker:
         self._browser = None
         self._page = None
         self._ready = threading.Event()
-        self._cmd_queue = []  # (action_fn, result_holder)
+        self._cmd_queue = []
         self._cmd_event = threading.Event()
         self._stop = False
+        self._headless = None
+
+    def _auto_install(self):
+        """Auto-install Playwright chromium binaries if missing."""
+        try:
+            console.print("[dim]Checking/Installing Playwright browsers...[/dim]")
+            subprocess.run(
+                ["npx", "playwright", "install", "chromium"],
+                check=True, timeout=180,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            console.print("[green]Playwright chromium installed/ready[/green]")
+            return True
+        except Exception as e:
+            console.print(f"[yellow]Playwright install warning: {e}[/yellow]")
+            return False
 
     def start(self):
-        if self._thread and self._thread.is_alive():
+        """Start browser worker with headless auto-detection."""
+        with _browser_lock:
+            if self._thread and self._thread.is_alive():
+                return True
+            # Detect headless environment
+            self._headless = os.environ.get("PLAYWRIGHT_HEADLESS", "false").lower() == "true"
+            if platform.system() == "Linux" and not os.environ.get("DISPLAY"):
+                self._headless = True
+            self._stop = False
+            self._ready.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            if not self._ready.wait(timeout=25):
+                console.print("[yellow]Browser start timeout — fallback mode[/yellow]")
+                self.close()
+                return False
             return True
-        self._stop = False
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self._ready.wait(timeout=15)
 
     def _run(self):
         try:
-            from playwright.sync_api import sync_playwright
+            self._auto_install()
+            from playwright.sync_api import sync_playwright, Error as PWError
             self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(headless=False)
+            launch_args = {"headless": self._headless}
+            if self._headless:
+                launch_args["args"] = [
+                    "--no-sandbox", "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage", "--disable-gpu"
+                ]
+            self._browser = self._pw.chromium.launch(**launch_args)
             self._page = self._browser.new_page()
             self._page.set_viewport_size({"width": 1280, "height": 720})
 
-            # Capture events
-            self._page.on("console", lambda msg: _browser_console_logs.append(f"[{msg.type}] {msg.text}") or (
-                _browser_console_logs.pop(0) if len(_browser_console_logs) > _MAX_BROWSER_LOGS else None))
-            self._page.on("request", lambda req: _browser_requests.append(f"{req.method} {req.url}") or (
-                _browser_requests.pop(0) if len(_browser_requests) > _MAX_BROWSER_LOGS else None))
-            self._page.on("pageerror", lambda err: _browser_errors.append(str(err)) or (
-                _browser_errors.pop(0) if len(_browser_errors) > _MAX_BROWSER_LOGS else None))
+            # Capture events (thread-safe with truncation)
+            def _safe_append(lst, item):
+                lst.append(item)
+                while len(lst) > _MAX_BROWSER_LOGS:
+                    lst.pop(0)
+
+            self._page.on("console", lambda msg: _safe_append(_browser_console_logs, f"[{msg.type}] {msg.text}"))
+            self._page.on("request", lambda req: _safe_append(_browser_requests, f"{req.method} {req.url}"))
+            self._page.on("pageerror", lambda err: _safe_append(_browser_errors, str(err)))
 
             self._ready.set()
 
@@ -2069,32 +2113,44 @@ class _BrowserWorker:
                         holder["result"] = f"[browser error: {e}]"
                     holder["done"].set()
         except Exception as e:
+            console.print(f"[red]Browser worker crashed: {e}[/red]")
             self._ready.set()  # unblock waiters
         finally:
-            try:
-                if self._browser:
-                    self._browser.close()
-                if self._pw:
-                    self._pw.stop()
-            except Exception:
-                pass
+            self._cleanup()
+
+    def _cleanup(self):
+        """Safely close browser and playwright."""
+        try:
+            if self._browser:
+                self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._pw:
+                self._pw.stop()
+        except Exception:
+            pass
+        self._browser = self._pw = self._page = None
 
     def execute(self, fn, timeout=30):
-        """Run a function on the browser thread and return result."""
+        """Run a function on the browser thread, auto-restart if dead."""
         if not self._thread or not self._thread.is_alive():
-            return "[browser error: browser was closed externally. It will auto-restart on next call.]"
+            console.print("[yellow]Browser was closed — restarting...[/yellow]")
+            self.close()
+            if not self.start():
+                return "[browser error: failed to restart]"
         holder = {"result": None, "done": threading.Event()}
         self._cmd_queue.append((fn, holder))
         self._cmd_event.set()
         if holder["done"].wait(timeout=timeout):
             return holder["result"]
-        return "[browser error: timeout — browser may have been closed]"
+        return "[browser error: timeout]"
 
     def close(self):
         self._stop = True
         self._cmd_event.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=8)
         self._thread = None
         _browser_console_logs.clear()
         _browser_requests.clear()
@@ -3244,6 +3300,7 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
 # ============================================================================
 
 _recent_tool_calls = []  # track last N tool calls to detect loops
+_recent_tool_calls_lock = threading.Lock()
 _MAX_SAME_CALL = 2  # max times same tool+args can repeat
 _loop_break = False  # signal to break agent loop
 
@@ -3265,10 +3322,11 @@ def execute_tools(content: list) -> list:
             call_sig = f"bash:{args.get('command', '')[:80]}"
         else:
             call_sig = f"{name}:{json.dumps(args, sort_keys=True)[:100]}"
-        same_count = sum(1 for c in _recent_tool_calls[-6:] if c == call_sig)
-        _recent_tool_calls.append(call_sig)
-        if len(_recent_tool_calls) > 20:
-            _recent_tool_calls.pop(0)
+        with _recent_tool_calls_lock:
+            same_count = sum(1 for c in _recent_tool_calls[-6:] if c == call_sig)
+            _recent_tool_calls.append(call_sig)
+            if len(_recent_tool_calls) > 20:
+                _recent_tool_calls.pop(0)
 
         if same_count >= _MAX_SAME_CALL:
             console.print(f"[yellow]Loop detected: {name} called {same_count+1}x with same args — skipping[/yellow]")
@@ -3904,11 +3962,12 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
 
         if subcmd == "kill":
             if bg_arg == "all":
-                for bg_id, proc in _bg_processes.items():
-                    if proc.poll() is None:
-                        proc.terminate()
-                        console.print(f"[info]Terminated {bg_id} (PID {proc.pid})[/info]")
-                _bg_processes.clear()
+                with _bg_processes_lock:
+                    for bg_id, proc in list(_bg_processes.items()):
+                        if proc.poll() is None:
+                            proc.terminate()
+                            console.print(f"[info]Terminated {bg_id} (PID {proc.pid})[/info]")
+                    _bg_processes.clear()
                 return True
             # Try by ID or PID
             found = False
@@ -4648,10 +4707,11 @@ OUTPUT THE JSON ARRAY NOW:"""
         return True
 
     elif command == "/undo":
-        if not _edit_history:
-            console.print("[info]Nothing to undo.[/info]")
-            return True
-        last = _edit_history.pop()
+        with _edit_history_lock:
+            if not _edit_history:
+                console.print("[info]Nothing to undo.[/info]")
+                return True
+            last = _edit_history.pop()
         try:
             with open(last["filePath"], "w", encoding="utf-8", newline="\n") as f:
                 f.write(last["content"])
@@ -4743,38 +4803,57 @@ OUTPUT THE JSON ARRAY NOW:"""
         return True
 
     elif command == "/update":
-        console.print("[dim]Checking for updates...[/dim]")
+        console.print("[dim]Checking for updates from npm...[/dim]")
         try:
-            # Check latest version on npm
-            r = subprocess.run("npm view @votadev/tooncode version",
-                               shell=True, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=15)
+            r = subprocess.run(
+                "npm view @votadev/tooncode version",
+                shell=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=15
+            )
             latest = r.stdout.strip()
-            if not latest:
-                console.print("[yellow]Could not check npm registry.[/yellow]")
+
+            if not latest or r.returncode != 0:
+                console.print("[yellow]Cannot connect to npm registry. Try again later.[/yellow]")
                 return True
 
             current = VERSION
             if latest == current:
                 console.print(f"[green]Already up to date (v{current})[/green]")
+                return True
+
+            console.print(f"[bold cyan]Update: v{current} -> v{latest}[/bold cyan]")
+            console.print("[dim]Installing... (10-30 seconds)[/dim]")
+
+            # Real-time output instead of capture_output (no hang)
+            process = subprocess.Popen(
+                "npm install -g @votadev/tooncode@latest",
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if line:
+                    console.print(f"[dim]{line}[/dim]")
+
+            process.wait()
+
+            if process.returncode == 0:
+                console.print(f"\n[bold green]Updated to v{latest}![/bold green]")
+                console.print("[bold yellow]Please restart ToonCode manually[/bold yellow]")
+                console.print("[dim]Type /quit then run: tooncode[/dim]")
             else:
-                console.print(f"[bold cyan]Update available: v{current} → v{latest}[/bold cyan]")
-                console.print("[dim]Updating...[/dim]")
-                # Clear npm cache for this package first
-                subprocess.run("npm cache clean --force 2>/dev/null",
-                               shell=True, capture_output=True, timeout=15)
-                r2 = subprocess.run("npm install -g @votadev/tooncode@latest",
-                                    shell=True, capture_output=True, text=True,
-                                    encoding="utf-8", errors="replace", timeout=120)
-                if r2.returncode == 0:
-                    console.print(f"[bold green]Updated to v{latest}! Restarting...[/bold green]")
-                    # Auto-restart with same args
-                    os.execv(sys.executable, [sys.executable] + sys.argv)
-                else:
-                    console.print(f"[error]Update failed: {r2.stderr[:200]}[/error]")
-                    console.print("[dim]Try manually: npm install -g @votadev/tooncode[/dim]")
+                console.print(f"[error]Install failed (code {process.returncode})[/error]")
+                console.print("[dim]Try manually: npm install -g @votadev/tooncode@latest[/dim]")
+
+        except subprocess.TimeoutExpired:
+            console.print("[error]Timeout checking npm[/error]")
         except Exception as e:
-            console.print(f"[error]Update check failed: {e}[/error]")
+            console.print(f"[error]Update failed: {e}[/error]")
         return True
 
     elif command == "/config":
@@ -5460,7 +5539,8 @@ def main(_initial_prompt=None):
                     # Hard break if loop detected too many times
                     if _loop_break:
                         _loop_break = False
-                        _recent_tool_calls.clear()
+                        with _recent_tool_calls_lock:
+                            _recent_tool_calls.clear()
                         console.print("[bold red]Stopped: AI stuck in loop. Back to prompt.[/bold red]")
                         break
 
@@ -5597,6 +5677,46 @@ More info: https://www.npmjs.com/package/@votadev/tooncode""",
     return args
 
 
+def _cleanup_all():
+    """Cleanup all resources on exit."""
+    global _team_running
+    # 1. Browser
+    if _browser_worker:
+        try:
+            _browser_worker.close()
+        except Exception:
+            pass
+
+    # 2. Background processes — use list() to avoid dict mutation during iteration
+    with _bg_processes_lock:
+        for bg_id, proc in list(_bg_processes.items()):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        _bg_processes.clear()
+
+    # 3. MCP servers
+    try:
+        _shutdown_mcp_servers()
+    except Exception:
+        pass
+
+    # 4. Team agents
+    try:
+        _team_running = False
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_all)
+
+
 if __name__ == "__main__":
     args = _cli()
 
@@ -5609,28 +5729,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         console.print("\n[dim]Goodbye![/dim]")
     finally:
-        # Cleanup everything on exit
-        # 1. Browser
-        if _browser_worker:
-            try:
-                _browser_worker.close()
-            except Exception:
-                pass
-
-        # 2. Background processes
-        for bg_id, proc in _bg_processes.items():
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
-            except Exception:
-                pass
-        _bg_processes.clear()
-
-        # 3. MCP servers
-        _shutdown_mcp_servers()
-
-        # 4. Team agents
-        try:
-            _team_running = False
-        except Exception:
-            pass
+        _cleanup_all()
