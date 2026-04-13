@@ -18,7 +18,10 @@ function findPython() {
 }
 
 function getVenvDir() {
-  return path.join(__dirname, "..", ".venv");
+  // Use ~/.tooncode/.venv so venv lives outside npm package dir
+  // This prevents EPERM errors on Windows when npm updates the package
+  const home = process.env.HOME || process.env.USERPROFILE || require("os").homedir();
+  return path.join(home, ".tooncode", ".venv");
 }
 
 function getVenvPython() {
@@ -38,6 +41,13 @@ function ensureVenv(python) {
   return venvPy;
 }
 
+// Clean up old venv inside npm package dir (pre-v2.5.6 location)
+const oldVenv = path.join(__dirname, "..", ".venv");
+if (fs.existsSync(oldVenv)) {
+  console.log(`${D}Migrating venv to ~/.tooncode/.venv...${X}`);
+  try { fs.rmSync(oldVenv, { recursive: true, force: true }); } catch {}
+}
+
 const python = findPython();
 if (!python) {
   console.log(`${Y}Python 3.10+ not found. Install: https://python.org${X}\n`);
@@ -48,7 +58,12 @@ console.log(`${D}Python: ${python}${X}`);
 const req = path.join(__dirname, "..", "requirements.txt");
 if (!fs.existsSync(req)) { process.exit(0); }
 
-// Strategy 1: venv inside package (works on all OS)
+// Ensure ~/.tooncode dir exists
+const home = process.env.HOME || process.env.USERPROFILE || require("os").homedir();
+const toonDir = path.join(home, ".tooncode");
+if (!fs.existsSync(toonDir)) { fs.mkdirSync(toonDir, { recursive: true }); }
+
+// Strategy 1: venv in ~/.tooncode/.venv (outside npm package dir)
 try {
   const venvPy = ensureVenv(python);
   console.log(`${D}Installing into venv...${X}`);

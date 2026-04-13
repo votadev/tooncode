@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name="tooncode",
     version="2.0.0",
-    description="AI Coding Agent CLI - Free, single-file, Claude Code alternative",
+    description="Thai AI Coding Agent CLI - Free, 21 tools, multi-agent team, semantic search",
     author="VotaLab",
     py_modules=["tooncode", "tui"],
     python_requires=">=3.10",
@@ -12,6 +12,7 @@ setup(
         "rich>=13.0.0",
         "prompt_toolkit>=3.0.0",
         "textual>=1.0.0",
+        "lancedb>=0.20.0",
     ],
     entry_points={
         "console_scripts": [

@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.5.5"
+VERSION = "2.6.0"
 
 import httpx
 import json
@@ -66,24 +66,15 @@ _worktree_original_cwd = None
 _DEFAULT_SETTINGS = {
     "api_url": "https://opencode.ai/zen/v1/messages",
     "api_key": "public",
-    "default_model": "minimax-m2.5-free",
+    "default_model": "big-pickle",
     "models": [
-        {"name": "minimax-m2.5-free", "context": 204800},
         {"name": "big-pickle", "context": 200000, "no_sampling": True},
+        {"name": "minimax-m2.5-free", "context": 204800},
         {"name": "nemotron-3-super-free", "context": 131072},
         {"name": "gpt-5-nano", "context": 1047576, "no_sampling": True},
     ],
     "auto_approve": True,
     "theme": "default",
-    "api_provider": "",  # "" = default (opencode), "puter" = Puter.com
-    "puter_token": "",
-    "puter_models": [
-        {"name": "google/gemini-2.5-flash", "context": 1048576},
-        {"name": "openai/gpt-5-nano", "context": 1047576},
-        {"name": "deepseek/deepseek-v3.2", "context": 131072},
-        {"name": "mistralai/devstral-2512", "context": 131072},
-        {"name": "openai/gpt-5.4", "context": 1047576},
-    ],
 }
 # Per-model settings example in settings.json:
 # {"name": "claude-sonnet", "context": 200000, "api_url": "https://api.anthropic.com/v1/messages", "api_key": "sk-ant-..."}
@@ -130,19 +121,6 @@ _settings = _load_settings()
 API_URL = _settings["api_url"]
 API_KEY = _settings.get("api_key", "public")
 
-# If provider is puter, use puter models
-if _settings.get("api_provider", "").lower() == "puter":
-    _puter_models = _settings.get("puter_models", []) + _settings.get("models", [])
-    # Deduplicate by name
-    _seen = set()
-    _deduped = []
-    for m in _puter_models:
-        if m["name"] not in _seen:
-            _deduped.append(m)
-            _seen.add(m["name"])
-    _settings["models"] = _deduped
-    if _settings.get("default_model", "minimax-m2.5-free") == "minimax-m2.5-free":
-        _settings["default_model"] = "google/gemini-2.5-flash"
 
 MODEL = _settings["default_model"]
 AVAILABLE_MODELS = [m["name"] for m in _settings["models"]]
@@ -164,128 +142,6 @@ def _get_api_key() -> str:
     cfg = _get_model_config(MODEL)
     return cfg.get("api_key", API_KEY)
 
-def _is_puter() -> bool:
-    """Check if current API provider is Puter."""
-    return _settings.get("api_provider", "").lower() == "puter"
-
-def _get_puter_token() -> str:
-    """Get Puter auth token from settings."""
-    return _settings.get("puter_token", "")
-
-def _convert_to_openai_messages(messages: list) -> list:
-    """Convert Anthropic-format messages to OpenAI-format messages."""
-    result = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-
-        # String content — pass through
-        if isinstance(content, str):
-            result.append({"role": role, "content": content})
-            continue
-
-        # List of content blocks (Anthropic format)
-        if isinstance(content, list):
-            # Check if it contains tool_result blocks
-            tool_results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
-            if tool_results:
-                for tr in tool_results:
-                    result.append({
-                        "role": "tool",
-                        "tool_call_id": tr.get("tool_use_id", ""),
-                        "content": tr.get("content", "") if isinstance(tr.get("content"), str) else json.dumps(tr.get("content", "")),
-                    })
-                continue
-
-            # Check if assistant message with tool_use blocks
-            tool_uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
-            text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-            text_combined = "\n".join(t for t in text_parts if t)
-
-            if tool_uses:
-                tool_calls = []
-                for tu in tool_uses:
-                    tool_calls.append({
-                        "id": tu.get("id", _gen_id("call", 24)),
-                        "type": "function",
-                        "function": {
-                            "name": tu.get("name", ""),
-                            "arguments": json.dumps(tu.get("input", {})),
-                        }
-                    })
-                msg_out = {"role": "assistant", "tool_calls": tool_calls}
-                if text_combined:
-                    msg_out["content"] = text_combined
-                result.append(msg_out)
-                continue
-
-            # Plain text blocks
-            if text_combined:
-                result.append({"role": role, "content": text_combined})
-            elif content:
-                # Fallback: stringify
-                result.append({"role": role, "content": json.dumps(content)})
-    return result
-
-def _convert_openai_tools(tools: list) -> list:
-    """Convert Anthropic tool definitions to OpenAI function format."""
-    result = []
-    for tool in tools:
-        result.append({
-            "type": "function",
-            "function": {
-                "name": tool.get("name", ""),
-                "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", {}),
-            }
-        })
-    return result
-
-def _convert_from_openai_response(data: dict) -> dict:
-    """Convert OpenAI chat completion response to Anthropic-format response."""
-    content = []
-    stop_reason = "end_turn"
-
-    choices = data.get("choices", [])
-    if not choices:
-        return {"content": [{"type": "text", "text": "(empty response)"}], "stop_reason": stop_reason}
-
-    choice = choices[0]
-    finish = choice.get("finish_reason", "stop")
-    if finish == "tool_calls":
-        stop_reason = "tool_use"
-    elif finish == "length":
-        stop_reason = "max_tokens"
-
-    message = choice.get("message", {})
-
-    # Text content
-    if message.get("content"):
-        content.append({"type": "text", "text": message["content"]})
-
-    # Tool calls
-    for tc in message.get("tool_calls", []):
-        fn = tc.get("function", {})
-        try:
-            args = json.loads(fn.get("arguments", "{}"))
-        except (json.JSONDecodeError, Exception):
-            args = {}
-        content.append({
-            "type": "tool_use",
-            "id": tc.get("id", _gen_id("toolu", 24)),
-            "name": fn.get("name", ""),
-            "input": args,
-        })
-
-    usage = data.get("usage", {})
-    return {
-        "content": content,
-        "stop_reason": stop_reason,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-        }
-    }
 
 def _gen_id(prefix: str, length: int = 24) -> str:
     """Generate IDs matching OpenCode format: prefix + hex + mixed alphanumeric."""
@@ -914,7 +770,7 @@ def _call_model_for_summary(prompt: str) -> str:
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
         "stream": False,
     }
-    if MODEL not in NO_SAMPLING_PARAMS and not _is_puter():
+    if MODEL not in NO_SAMPLING_PARAMS:
         body["temperature"] = 0.7
 
     headers = dict(HEADERS)
@@ -3117,29 +2973,16 @@ You are a sub-agent. Complete the task and report your result concisely."""
             if time.time() - agent_start > AGENT_TIMEOUT:
                 all_output.append(f"\n[agent timed out after {AGENT_TIMEOUT}s]")
                 break
-            if _is_puter():
-                oai_msgs = [{"role": "system", "content": system}] + _convert_to_openai_messages(messages)
-                oai_tools = _convert_openai_tools(_SUBAGENT_TOOLS)
-                body = {
-                    "model": MODEL,
-                    "max_tokens": 16000,
-                    "messages": oai_msgs,
-                    "tools": oai_tools if oai_tools else None,
-                    "tool_choice": "auto" if oai_tools else None,
-                    "stream": False,
-                }
-                body = {k: v for k, v in body.items() if v is not None}
-            else:
-                body = {
-                    "model": MODEL,
-                    "max_tokens": 16000,
-                    "system": [{"type": "text", "text": system}],
-                    "messages": messages,
-                    "tools": _SUBAGENT_TOOLS,
-                    "tool_choice": {"type": "auto"},
-                    "stream": False,
-                }
-            if MODEL not in NO_SAMPLING_PARAMS and not _is_puter():
+            body = {
+                "model": MODEL,
+                "max_tokens": 16000,
+                "system": [{"type": "text", "text": system}],
+                "messages": messages,
+                "tools": _SUBAGENT_TOOLS,
+                "tool_choice": {"type": "auto"},
+                "stream": False,
+            }
+            if MODEL not in NO_SAMPLING_PARAMS:
                 body["temperature"] = 1
                 body["top_k"] = 40
                 body["top_p"] = 0.95
@@ -3149,8 +2992,6 @@ You are a sub-agent. Complete the task and report your result concisely."""
                 if resp.status_code != 200:
                     return f"[agent error: HTTP {resp.status_code}]"
                 data = resp.json()
-                if _is_puter():
-                    data = _convert_from_openai_response(data)
 
             content = data.get("content", [])
             if not content:
@@ -4428,11 +4269,6 @@ class StreamRenderer:
 # ============================================================================
 
 def make_request_headers() -> dict:
-    if _is_puter():
-        return {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {_get_puter_token()}",
-        }
     msg_id = _gen_id("msg", 24)
     h = {
         **HEADERS,
@@ -4449,8 +4285,6 @@ def make_request_headers() -> dict:
 
 def _get_current_api_url() -> str:
     """Get API URL for current request."""
-    if _is_puter():
-        return "https://api.puter.com/puterai/openai/v1/chat/completions"
     return _get_api_url()
 
 
@@ -4507,140 +4341,6 @@ def _validate_messages(messages: list):
     messages.extend(fixed)
 
 
-def _puter_request(messages: list, system_prompt: str, tools: list, renderer) -> dict:
-    """Handle API request via Puter (OpenAI-compatible format with streaming)."""
-    global total_input_tokens, total_output_tokens, last_input_tokens
-
-    # Convert to OpenAI format
-    oai_messages = [{"role": "system", "content": system_prompt}] + _convert_to_openai_messages(messages)
-    oai_tools = _convert_openai_tools(tools)
-
-    body = {
-        "model": MODEL,
-        "max_tokens": 32000,
-        "messages": oai_messages,
-        "tools": oai_tools if oai_tools else None,
-        "tool_choice": "auto" if oai_tools else None,
-        "stream": True,
-    }
-    # Remove None values
-    body = {k: v for k, v in body.items() if v is not None}
-
-    # Don't send temperature/sampling params — many Puter models only accept default (1)
-
-    headers = make_request_headers()
-
-    # Streaming with OpenAI SSE format
-    content_text = ""
-    tool_calls_map = {}  # index -> {id, name, arguments}
-    stop_reason = "end_turn"
-
-    try:
-        with httpx.Client(timeout=httpx.Timeout(300.0, connect=15.0, read=300.0)) as client:
-            with client.stream("POST", _get_current_api_url(), headers=headers, json=body) as resp:
-                if resp.status_code != 200:
-                    err = resp.read().decode(errors="replace")
-                    console.print(f"[error]Puter API Error ({resp.status_code}): {err[:500]}[/error]")
-                    return {"content": [{"type": "text", "text": f"API Error {resp.status_code}: {err[:200]}"}], "stop_reason": "error"}
-
-                renderer.on_text_start()
-                line_buf = b""
-                for chunk in resp.iter_bytes():
-                    line_buf += chunk
-                    while b"\n" in line_buf:
-                        raw_line, line_buf = line_buf.split(b"\n", 1)
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                        elif line.startswith("{"):
-                            data_str = line
-                        else:
-                            continue
-                        if data_str.strip() in ("[DONE]", ""):
-                            continue
-                        try:
-                            event = json.loads(data_str)
-                        except (json.JSONDecodeError, Exception):
-                            continue
-
-                        # OpenAI streaming format
-                        choices = event.get("choices", [])
-                        if not choices:
-                            # Usage info
-                            usage = event.get("usage", {})
-                            if usage:
-                                total_input_tokens += usage.get("prompt_tokens", 0)
-                                total_output_tokens += usage.get("completion_tokens", 0)
-                                last_input_tokens = usage.get("prompt_tokens", 0)
-                            continue
-
-                        delta = choices[0].get("delta", {})
-                        finish = choices[0].get("finish_reason")
-
-                        # Text content
-                        if delta.get("content"):
-                            content_text += delta["content"]
-                            renderer.on_text_delta(delta["content"])
-
-                        # Tool calls
-                        for tc in delta.get("tool_calls", []):
-                            idx = tc.get("index", 0)
-                            if idx not in tool_calls_map:
-                                tool_calls_map[idx] = {
-                                    "id": tc.get("id", _gen_id("toolu", 24)),
-                                    "name": tc.get("function", {}).get("name", ""),
-                                    "arguments": "",
-                                }
-                            if tc.get("function", {}).get("name"):
-                                tool_calls_map[idx]["name"] = tc["function"]["name"]
-                            if tc.get("function", {}).get("arguments"):
-                                tool_calls_map[idx]["arguments"] += tc["function"]["arguments"]
-
-                        if finish:
-                            if finish == "tool_calls":
-                                stop_reason = "tool_use"
-                            elif finish == "length":
-                                stop_reason = "max_tokens"
-                            else:
-                                stop_reason = "end_turn"
-
-                renderer.on_text_stop()
-
-    except httpx.ConnectError as e:
-        console.print(f"[error]Puter connection error: {e}[/error]")
-        return {"content": [{"type": "text", "text": f"Connection error: {e}"}], "stop_reason": "error"}
-    except httpx.ReadTimeout:
-        console.print("[error]Puter request timed out[/error]")
-        return {"content": [{"type": "text", "text": "Request timed out"}], "stop_reason": "error"}
-    except Exception as e:
-        console.print(f"[error]Puter error: {e}[/error]")
-        return {"content": [{"type": "text", "text": f"Error: {e}"}], "stop_reason": "error"}
-
-    # Build Anthropic-format result
-    result_content = []
-    if content_text:
-        result_content.append({"type": "text", "text": content_text})
-    for idx in sorted(tool_calls_map.keys()):
-        tc = tool_calls_map[idx]
-        try:
-            args = json.loads(tc["arguments"])
-        except (json.JSONDecodeError, Exception):
-            args = {}
-        result_content.append({
-            "type": "tool_use",
-            "id": tc["id"],
-            "name": tc["name"],
-            "input": args,
-        })
-
-    if not result_content:
-        result_content.append({"type": "text", "text": "(empty response)"})
-
-    return {"content": result_content, "stop_reason": stop_reason}
-
-
 def stream_response(messages: list, renderer: StreamRenderer) -> dict:
     """Send request and stream the response, returning parsed content blocks."""
     global total_input_tokens, total_output_tokens, last_input_tokens
@@ -4649,10 +4349,6 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
     _validate_messages(messages)
 
     system_prompt = build_system_prompt()
-
-    # === Puter API path (OpenAI-compatible, non-streaming for reliability) ===
-    if _is_puter():
-        return _puter_request(messages, system_prompt, TOOLS, renderer)
 
     body = {
         "model": MODEL,
@@ -6422,6 +6118,17 @@ OUTPUT THE JSON ARRAY NOW:"""
             console.print(f"[bold cyan]Update: v{current} -> v{latest}[/bold cyan]")
             console.print("[dim]Installing... (10-30 seconds)[/dim]")
 
+            # Clean up old venv inside npm package to prevent EPERM on Windows
+            try:
+                npm_prefix = subprocess.run("npm prefix -g", shell=True, capture_output=True,
+                                            text=True, encoding="utf-8", errors="replace", timeout=10)
+                old_venv = os.path.join(npm_prefix.stdout.strip(), "node_modules", "@votadev", "tooncode", ".venv")
+                if os.path.isdir(old_venv):
+                    import shutil
+                    shutil.rmtree(old_venv, ignore_errors=True)
+            except Exception:
+                pass
+
             # Real-time output instead of capture_output (no hang)
             process = subprocess.Popen(
                 "npm install -g @votadev/tooncode@latest",
@@ -7333,17 +7040,6 @@ Settings: ~/.tooncode/settings.json
     "auto_approve": true
   }
 
-  Puter.com (free - 500+ models):
-  {
-    "api_provider": "puter",
-    "puter_token": "YOUR_PUTER_TOKEN",
-    "default_model": "google/gemini-2.5-flash",
-    "auto_approve": true
-  }
-  Get token: sign up at https://puter.com -> Developer Console -> puter.authToken
-  Models: openai/gpt-5-nano, openai/gpt-5.4, google/gemini-2.5-flash,
-          deepseek/deepseek-v3.2, mistralai/devstral-2512
-
 More info: https://www.npmjs.com/package/@votadev/tooncode""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -7369,6 +7065,16 @@ More info: https://www.npmjs.com/package/@votadev/tooncode""",
 
     # --update
     if args.update:
+        # Clean up old venv inside npm package to prevent EPERM on Windows
+        try:
+            import shutil
+            npm_prefix = subprocess.run("npm prefix -g", shell=True, capture_output=True,
+                                        text=True, encoding="utf-8", errors="replace", timeout=10)
+            old_venv = os.path.join(npm_prefix.stdout.strip(), "node_modules", "@votadev", "tooncode", ".venv")
+            if os.path.isdir(old_venv):
+                shutil.rmtree(old_venv, ignore_errors=True)
+        except Exception:
+            pass
         os.system("npm install -g @votadev/tooncode@latest")
         sys.exit(0)
 

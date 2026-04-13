@@ -1,6 +1,6 @@
 # ToonCode — 🇹🇭 Thai Coding Agent CLI
 
-> **by VotaLab** | v2.0.0 | Claude Code alternative powered by free AI models
+> **by VotaLab** | v2.5.0 | Thai AI Coding Agent powered by free AI models
 
 ```
   ████████╗ ██████╗  ██████╗ ███╗   ██╗ ██████╗ ██████╗ ██████╗ ███████╗
@@ -8,7 +8,7 @@
      ╚═╝    ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
 ```
 
-ToonCode is a **free, open-source** AI coding agent that runs in your terminal. It uses free AI models (no API key needed) and provides a Claude Code-like experience with 20+ tools, multi-agent teams, browser automation, and more.
+ToonCode is a **free, open-source** Thai AI coding agent that runs in your terminal. It uses free AI models (no API key needed) and provides a professional coding experience with 21 tools, multi-agent teams, semantic search, browser automation, and more.
 
 ---
 
@@ -113,7 +113,7 @@ tooncode minimax-m2.5-free ~/my-project  # Model + directory
 | `memory_save` | Save notes for future sessions |
 | `memory_search` | Search past memories |
 | `task_create/update/list` | Task management |
-| `bosshelp` | Escalate to Claude Code or fallback model |
+| `bosshelp` | Escalate to Boss AI or fallback model |
 
 ### Slash Commands
 
@@ -121,7 +121,7 @@ tooncode minimax-m2.5-free ~/my-project  # Model + directory
 |---------|-------------|
 | `/help` | Show all commands |
 | `/model [name]` | Switch AI model |
-| `/boss <task>` | Create task plan (uses Claude Code or own model) |
+| `/boss <task>` | Create task plan (uses Boss AI or own model) |
 | `/team <task>` | Multi-agent team: planner + frontend + backend + reviewer + tester |
 | `/plan` | Toggle Plan Mode (read-only) |
 | `/do` | Execute pending tasks |
@@ -188,7 +188,7 @@ Auto-fallback: if a model fails, ToonCode automatically tries the next one.
 
 ToonCode auto-reads these files from your project:
 - `TOONCODE.md` — ToonCode project context
-- `CLAUDE.md` — Claude Code context (auto-imported)
+- `CLAUDE.md` — Boss AI context (auto-imported)
 - `GEMINI.md` — Gemini context
 - `.cursorrules` — Cursor rules
 - `COPILOT.md` — Copilot instructions

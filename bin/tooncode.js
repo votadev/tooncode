@@ -16,8 +16,15 @@ function findPython() {
   return null;
 }
 
+function getVenvDir() {
+  // Use ~/.tooncode/.venv so venv lives outside npm package dir
+  // This prevents EPERM errors on Windows when npm updates the package
+  const home = process.env.HOME || process.env.USERPROFILE || require("os").homedir();
+  return path.join(home, ".tooncode", ".venv");
+}
+
 function getVenvPython() {
-  const venvDir = path.join(__dirname, "..", ".venv");
+  const venvDir = getVenvDir();
   return process.platform === "win32"
     ? path.join(venvDir, "Scripts", "python.exe")
     : path.join(venvDir, "bin", "python");
@@ -31,9 +38,12 @@ function checkDeps(py) {
 }
 
 function ensureVenv(sysPython) {
-  const venvDir = path.join(__dirname, "..", ".venv");
+  const venvDir = getVenvDir();
   const venvPy = getVenvPython();
   if (!fs.existsSync(venvPy)) {
+    // Ensure ~/.tooncode dir exists
+    const parentDir = path.dirname(venvDir);
+    if (!fs.existsSync(parentDir)) { fs.mkdirSync(parentDir, { recursive: true }); }
     console.log(`${C}Creating virtual environment...${X}`);
     execSync(`${sysPython} -m venv "${venvDir}"`, { stdio: "pipe", timeout: 60000 });
   }
