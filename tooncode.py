@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.5.2"
+VERSION = "2.5.3"
 
 import httpx
 import json
@@ -914,7 +914,7 @@ def _call_model_for_summary(prompt: str) -> str:
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
         "stream": False,
     }
-    if MODEL not in NO_SAMPLING_PARAMS:
+    if MODEL not in NO_SAMPLING_PARAMS and not _is_puter():
         body["temperature"] = 0.7
 
     headers = dict(HEADERS)
@@ -3139,10 +3139,9 @@ You are a sub-agent. Complete the task and report your result concisely."""
                     "tool_choice": {"type": "auto"},
                     "stream": False,
                 }
-            if MODEL not in NO_SAMPLING_PARAMS:
-                body["temperature"] = 1 if not _is_puter() else 0.7
-                if not _is_puter():
-                    body["top_k"] = 40
+            if MODEL not in NO_SAMPLING_PARAMS and not _is_puter():
+                body["temperature"] = 1
+                body["top_k"] = 40
                 body["top_p"] = 0.95
 
             with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
@@ -4527,9 +4526,7 @@ def _puter_request(messages: list, system_prompt: str, tools: list, renderer) ->
     # Remove None values
     body = {k: v for k, v in body.items() if v is not None}
 
-    if MODEL not in NO_SAMPLING_PARAMS:
-        body["temperature"] = 0.7
-        body["top_p"] = 0.95
+    # Don't send temperature/sampling params — many Puter models only accept default (1)
 
     headers = make_request_headers()
 
@@ -7324,7 +7321,8 @@ def _cli():
 
 Settings: ~/.tooncode/settings.json
   Add/remove models, change defaults, set API URL.
-  Example settings.json:
+
+  Default (OpenCode - free):
   {
     "default_model": "big-pickle",
     "models": [
@@ -7334,6 +7332,17 @@ Settings: ~/.tooncode/settings.json
     "api_url": "https://opencode.ai/zen/v1/messages",
     "auto_approve": true
   }
+
+  Puter.com (free - 500+ models):
+  {
+    "api_provider": "puter",
+    "puter_token": "YOUR_PUTER_TOKEN",
+    "default_model": "openai/gpt-5-nano",
+    "auto_approve": true
+  }
+  Get token: sign up at https://puter.com -> Developer Console -> puter.authToken
+  Models: openai/gpt-5-nano, anthropic/claude-haiku-4.5, google/gemini-2.5-flash,
+          deepseek/deepseek-v3.2, mistralai/devstral-2512, and 500+ more
 
 More info: https://www.npmjs.com/package/@votadev/tooncode""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
