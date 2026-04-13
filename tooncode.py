@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.5"
+VERSION = "2.3.6"
 
 import httpx
 import json
@@ -1186,12 +1186,28 @@ def exec_bash(args: dict) -> str:
         return _exec_bash_background(cmd, workdir)
 
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            cwd=workdir, timeout=timeout_s,
-            stdin=subprocess.DEVNULL,
-            encoding="utf-8", errors="replace",
-        )
+        # On Windows: try PowerShell first if command looks like PS
+        use_ps = False
+        if platform.system() == "Windows":
+            ps_indicators = ["Get-", "Set-", "Remove-", "New-", "Select-", "Where-", "Out-", "ForEach-", "Import-", "Export-", "Invoke-"]
+            if any(re.search(p, cmd) for p in ps_indicators):
+                use_ps = True
+        
+        if use_ps:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True, text=True,
+                cwd=workdir, timeout=timeout_s,
+                stdin=subprocess.DEVNULL,
+                encoding="utf-8", errors="replace",
+            )
+        else:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                cwd=workdir, timeout=timeout_s,
+                stdin=subprocess.DEVNULL,
+                encoding="utf-8", errors="replace",
+            )
         output = ""
         if result.stdout:
             output += result.stdout
@@ -1199,6 +1215,9 @@ def exec_bash(args: dict) -> str:
             output += result.stderr
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
+        # Detect PowerShell commands run in cmd.exe
+        if "is not recognized as an internal or external command" in output:
+            output += "\n\n[HINT: Command not found. Use cmd.exe syntax (del, dir, type) or use tools directly (read, write, list_dir, web_fetch). Do NOT use PowerShell cmdlets.]"
         return output[:50000] or "(no output)"
     except subprocess.TimeoutExpired:
         console.print(f"[yellow]Command timed out after {timeout_s:.0f}s — restarting in background...[/yellow]")
@@ -3222,6 +3241,7 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
 
 _recent_tool_calls = []  # track last N tool calls to detect loops
 _MAX_SAME_CALL = 2  # max times same tool+args can repeat
+_loop_break = False  # signal to break agent loop
 
 def execute_tools(content: list) -> list:
     """Execute all tool calls and return tool results."""
@@ -3235,7 +3255,11 @@ def execute_tools(content: list) -> list:
         tool_id = block["id"]
 
         # Anti-loop: detect same tool call repeating
-        call_sig = f"{name}:{json.dumps(args, sort_keys=True)[:200]}"
+        # Use shorter signature to catch similar (not just exact) repeated calls
+        if name == "bash":
+            call_sig = f"bash:{args.get('command', '')[:80]}"
+        else:
+            call_sig = f"{name}:{json.dumps(args, sort_keys=True)[:100]}"
         same_count = sum(1 for c in _recent_tool_calls[-6:] if c == call_sig)
         _recent_tool_calls.append(call_sig)
         if len(_recent_tool_calls) > 20:
@@ -3243,6 +3267,8 @@ def execute_tools(content: list) -> list:
 
         if same_count >= _MAX_SAME_CALL:
             console.print(f"[yellow]Loop detected: {name} called {same_count+1}x with same args — skipping[/yellow]")
+            if same_count >= 4:
+                _loop_break = True
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_id,
@@ -5424,6 +5450,14 @@ def main(_initial_prompt=None):
                     tool_results = execute_tools(content)
 
                     messages.append({"role": "user", "content": tool_results})
+
+                    # Hard break if loop detected too many times
+                    if _loop_break:
+                        _loop_break = False
+                        _recent_tool_calls.clear()
+                        console.print("[bold red]Stopped: AI stuck in loop. Back to prompt.[/bold red]")
+                        break
+
                     continue  # Always continue after tool use
 
                 # No tool use - AI gave a text response
