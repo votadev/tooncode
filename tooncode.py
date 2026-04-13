@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.6"
+VERSION = "2.3.8"
 
 import httpx
 import json
@@ -3245,6 +3245,7 @@ _loop_break = False  # signal to break agent loop
 
 def execute_tools(content: list) -> list:
     """Execute all tool calls and return tool results."""
+    global _loop_break
     tool_results = []
     for block in content:
         if block["type"] != "tool_use":
@@ -4973,7 +4974,7 @@ def print_banner():
 
 
 def main(_initial_prompt=None):
-    global MODEL, CWD, message_count
+    global MODEL, CWD, message_count, _loop_break
 
     # Fix Windows encoding for Thai/Unicode
     if platform.system() == "Windows":
