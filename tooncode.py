@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.3.8"
+VERSION = "2.3.9"
 
 import httpx
 import json
@@ -2528,6 +2528,9 @@ def run_team(task: str, roles: list = None):
         _team_threads.append(t)
 
     # Stagger starts: planner first, then others
+    if not _team_threads:
+        console.print("[red]No team agents to start[/red]")
+        return ""
     _team_threads[0].start()
     time.sleep(3)  # let planner create the plan
     for t in _team_threads[1:]:
@@ -3160,7 +3163,7 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
 
                         elif etype == "content_block_stop":
                             if current_block:
-                                if current_block["type"] == "tool_use":
+                                if current_block.get("type") == "tool_use":
                                     try:
                                         current_block["input"] = json.loads(current_block.get("input_json", "{}"))
                                     except (json.JSONDecodeError, Exception):
@@ -3168,9 +3171,9 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
                                     if "input_json" in current_block:
                                         del current_block["input_json"]
                                     renderer.on_tool_stop()
-                                elif current_block["type"] == "thinking":
+                                elif current_block.get("type") == "thinking":
                                     renderer.on_thinking_stop()
-                                elif current_block["type"] == "text":
+                                elif current_block.get("type") == "text":
                                     renderer.on_text_stop()
                                 content_blocks.append(current_block)
                             current_block = None
@@ -3198,7 +3201,7 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
 
     # Flush any remaining block (GPT models may not send content_block_stop)
     if current_block:
-        if current_block["type"] == "tool_use":
+        if current_block.get("type") == "tool_use":
             try:
                 current_block["input"] = json.loads(current_block.get("input_json", "{}"))
             except (json.JSONDecodeError, Exception):
@@ -3211,15 +3214,16 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
     # Build response content list
     result_content = []
     for block in content_blocks:
-        if block["type"] == "text":
+        btype = block.get("type", "text")
+        if btype == "text":
             result_content.append({"type": "text", "text": block.get("text", "")})
-        elif block["type"] == "thinking":
+        elif btype == "thinking":
             result_content.append({
                 "type": "thinking",
                 "thinking": block.get("thinking", ""),
                 "signature": block.get("signature", ""),
             })
-        elif block["type"] == "tool_use":
+        elif btype == "tool_use":
             result_content.append({
                 "type": "tool_use",
                 "id": block.get("id", ""),
@@ -3248,12 +3252,12 @@ def execute_tools(content: list) -> list:
     global _loop_break
     tool_results = []
     for block in content:
-        if block["type"] != "tool_use":
+        if block.get("type") != "tool_use":
             continue
 
-        name = block["name"]
+        name = block.get("name", "unknown")
         args = block.get("input", {})
-        tool_id = block["id"]
+        tool_id = block.get("id", "")
 
         # Anti-loop: detect same tool call repeating
         # Use shorter signature to catch similar (not just exact) repeated calls
@@ -3969,7 +3973,8 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         if "--roles" in arg:
             parts_r = arg.split("--roles")
             task_text = parts_r[0].strip()
-            role_str = parts_r[1].strip().split()[0] if len(parts_r) > 1 else ""
+            role_parts = parts_r[1].strip().split() if len(parts_r) > 1 else []
+            role_str = role_parts[0] if role_parts else ""
             if role_str:
                 roles = [r.strip() for r in role_str.split(",") if r.strip()]
 
