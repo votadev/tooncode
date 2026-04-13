@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.6.0"
+VERSION = "2.6.2"
 
 import httpx
 import json
@@ -26,6 +26,7 @@ import random
 import threading
 import atexit
 import signal
+from collections import deque
 from datetime import datetime
 from typing import Optional, Dict
 
@@ -211,7 +212,7 @@ last_input_tokens = 0  # input tokens of the most recent request (= context used
 message_count = 0
 
 # Edit history for /undo
-_edit_history = []  # max 50 entries, trimmed on append
+_edit_history = deque(maxlen=50)  # auto-trims oldest on append
 _edit_history_lock = threading.Lock()
 _MAX_EDIT_HISTORY = 50
 
@@ -577,10 +578,12 @@ def _build_codebase_index(directory: str = None) -> str:
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
                         content = f.read(50000)
+                    seen = set()
                     syms = []
                     for m in _SYMBOL_RE.finditer(content):
                         sym = m.group(1) or m.group(2) or m.group(3) or m.group(4)
-                        if sym and sym not in syms:
+                        if sym and sym not in seen:
+                            seen.add(sym)
                             syms.append(sym)
                     if syms:
                         symbols_by_file[rel_path] = syms
@@ -1262,7 +1265,28 @@ NO_SAMPLING_PARAMS = {m["name"] for m in _settings["models"] if m.get("no_sampli
 # System Prompt
 # ============================================================================
 
+_system_prompt_cache = {"prompt": None, "mtimes": {}, "model": None, "plan_mode": None}
+
 def build_system_prompt() -> str:
+    # Cache: only rebuild if context files changed, model changed, or plan_mode changed
+    _context_files_for_cache = [
+        "TOONCODE.md", "CLAUDE.md", ".claude/CLAUDE.md", "GEMINI.md",
+        ".cursorrules", ".cursor/rules", "COPILOT.md",
+        ".github/copilot-instructions.md", "AGENTS.md", "AI_CONTEXT.md",
+    ]
+    current_mtimes = {}
+    for cf in _context_files_for_cache:
+        cf_path = os.path.join(CWD, cf)
+        try:
+            current_mtimes[cf] = os.path.getmtime(cf_path)
+        except OSError:
+            pass
+    cache = _system_prompt_cache
+    if (cache["prompt"] is not None
+        and cache["mtimes"] == current_mtimes
+        and cache["model"] == MODEL
+        and cache["plan_mode"] == plan_mode):
+        return cache["prompt"]
     prompt = f"""You are ToonCode, an expert AI coding agent. You MUST use tools to complete tasks — never just talk about what you would do.
 
 # CRITICAL RULES
@@ -1411,6 +1435,11 @@ You are in PLAN MODE. You must ONLY:
                 except Exception:
                     pass
 
+    # Update cache
+    cache["prompt"] = prompt
+    cache["mtimes"] = current_mtimes
+    cache["model"] = MODEL
+    cache["plan_mode"] = plan_mode
     return prompt
 
 
@@ -1706,6 +1735,12 @@ TOOLS = [
 _bg_processes: Dict[str, subprocess.Popen] = {}
 _bg_processes_lock = threading.Lock()
 
+def _cleanup_dead_bg_processes():
+    """Remove finished background processes from tracking dict."""
+    dead = [bg_id for bg_id, proc in _bg_processes.items() if proc.poll() is not None]
+    for bg_id in dead:
+        del _bg_processes[bg_id]
+
 # Commands that should auto-run in background
 _BG_PATTERNS = [
     # Node / JS
@@ -1926,6 +1961,7 @@ def _exec_bash_background(cmd: str, workdir: str) -> str:
             output = "(server started, output not captured)"
 
         with _bg_processes_lock:
+            _cleanup_dead_bg_processes()
             bg_id = f"bg_{len(_bg_processes)+1}"
             _bg_processes[bg_id] = proc
 
@@ -2063,8 +2099,6 @@ def exec_write(args: dict) -> str:
                     old_content = f.read()
                 with _edit_history_lock:
                     _edit_history.append({"filePath": fpath, "content": old_content})
-                    if len(_edit_history) > _MAX_EDIT_HISTORY:
-                        _edit_history.pop(0)
             except Exception:
                 pass
         with open(fpath, "w", encoding="utf-8", newline="\n") as f:
@@ -2091,8 +2125,6 @@ def exec_edit(args: dict) -> str:
         # Save for /undo
         with _edit_history_lock:
             _edit_history.append({"filePath": fpath, "content": content})
-            if len(_edit_history) > _MAX_EDIT_HISTORY:
-                _edit_history.pop(0)
         count = content.count(old)
         if count == 0:
             # Show actual file content so AI can see what's really there
@@ -2128,8 +2160,6 @@ def exec_multi_edit(args: dict) -> str:
         original = content
         with _edit_history_lock:
             _edit_history.append({"filePath": fpath, "content": content})
-            if len(_edit_history) > _MAX_EDIT_HISTORY:
-                _edit_history.pop(0)
         applied = 0
         for i, edit in enumerate(edits):
             old = edit.get("oldString", "")
@@ -2160,6 +2190,8 @@ def exec_glob(args: dict) -> str:
         return f"[error: {e}]"
 
 
+_regex_cache = {}  # cache compiled regexes
+
 def exec_grep(args: dict) -> str:
     pattern = args.get("pattern", "")
     path = args.get("path", CWD)
@@ -2168,7 +2200,10 @@ def exec_grep(args: dict) -> str:
         file_pattern = os.path.join(path, "**", include)
         files = glob_mod.glob(file_pattern, recursive=True)
         results = []
-        regex = re.compile(pattern, re.IGNORECASE)
+        cache_key = (pattern, re.IGNORECASE)
+        if cache_key not in _regex_cache:
+            _regex_cache[cache_key] = re.compile(pattern, re.IGNORECASE)
+        regex = _regex_cache[cache_key]
         for fpath in files[:1000]:
             if os.path.isdir(fpath):
                 continue
@@ -2665,9 +2700,9 @@ def exec_screenshot(args: dict) -> str:
 # Browser (Playwright)
 # ============================================================================
 
-_browser_console_logs = []
-_browser_requests = []
-_browser_errors = []
+_browser_console_logs = deque(maxlen=200)
+_browser_requests = deque(maxlen=200)
+_browser_errors = deque(maxlen=200)
 _MAX_BROWSER_LOGS = 200
 _browser_lock = threading.Lock()
 
@@ -2738,8 +2773,6 @@ class _BrowserWorker:
             # Capture events (thread-safe with truncation)
             def _safe_append(lst, item):
                 lst.append(item)
-                while len(lst) > _MAX_BROWSER_LOGS:
-                    lst.pop(0)
 
             self._page.on("console", lambda msg: _safe_append(_browser_console_logs, f"[{msg.type}] {msg.text}"))
             self._page.on("request", lambda req: _safe_append(_browser_requests, f"{req.method} {req.url}"))
@@ -4371,16 +4404,21 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
     current_block = None
     stop_reason = "end_turn"  # default; updated from message_delta
 
-    # Sanitize body: remove surrogate characters that break JSON encoding
-    def _sanitize(obj):
-        if isinstance(obj, str):
-            return obj.encode("utf-8", errors="replace").decode("utf-8")
-        elif isinstance(obj, dict):
-            return {k: _sanitize(v) for k, v in obj.items()}
+    # Sanitize body in-place: remove surrogate characters that break JSON encoding
+    def _sanitize_inplace(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str):
+                    obj[k] = v.encode("utf-8", errors="replace").decode("utf-8")
+                elif isinstance(v, (dict, list)):
+                    _sanitize_inplace(v)
         elif isinstance(obj, list):
-            return [_sanitize(v) for v in obj]
-        return obj
-    body = _sanitize(body)
+            for i, v in enumerate(obj):
+                if isinstance(v, str):
+                    obj[i] = v.encode("utf-8", errors="replace").decode("utf-8")
+                elif isinstance(v, (dict, list)):
+                    _sanitize_inplace(v)
+    _sanitize_inplace(body)
 
     try:
         with httpx.Client(timeout=httpx.Timeout(300.0, connect=15.0, read=300.0)) as client:
@@ -4579,7 +4617,7 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
 # Tool Execution with Rich Output
 # ============================================================================
 
-_recent_tool_calls = []  # track last N tool calls to detect loops
+_recent_tool_calls = deque(maxlen=20)  # track last N tool calls to detect loops
 _recent_tool_calls_lock = threading.Lock()
 _MAX_SAME_CALL = 2  # max times same tool+args can repeat
 _loop_break = False  # signal to break agent loop
@@ -4603,10 +4641,8 @@ def execute_tools(content: list) -> list:
         else:
             call_sig = f"{name}:{json.dumps(args, sort_keys=True)[:100]}"
         with _recent_tool_calls_lock:
-            same_count = sum(1 for c in _recent_tool_calls[-6:] if c == call_sig)
+            same_count = sum(1 for c in list(_recent_tool_calls)[-6:] if c == call_sig)
             _recent_tool_calls.append(call_sig)
-            if len(_recent_tool_calls) > 20:
-                _recent_tool_calls.pop(0)
 
         if same_count >= _MAX_SAME_CALL:
             console.print(f"[yellow]Loop detected: {name} called {same_count+1}x with same args — skipping[/yellow]")
@@ -5218,7 +5254,6 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
             bg_table.add_column("PID", style="bold")
             bg_table.add_column("Status", style="cyan")
             bg_table.add_column("Command", style="dim")
-            dead = []
             for bg_id, proc in _bg_processes.items():
                 alive = proc.poll() is None
                 status = "[green]running[/green]" if alive else f"[red]exited ({proc.returncode})[/red]"
@@ -5227,13 +5262,10 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
                 if hasattr(proc, 'args'):
                     cmd_str = str(proc.args)[:60]
                 bg_table.add_row(bg_id, str(proc.pid), status, cmd_str)
-                if not alive:
-                    dead.append(bg_id)
             console.print(bg_table)
             console.print(f"\n[info]/bg kill <id|pid|all> to stop  |  /bg logs <id> to see output[/info]")
             # Cleanup dead processes
-            for d in dead:
-                del _bg_processes[d]
+            _cleanup_dead_bg_processes()
             return True
 
         parts_bg = arg.split(None, 1)
