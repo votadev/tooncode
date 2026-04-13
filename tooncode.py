@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.5.3"
+VERSION = "2.5.4"
 
 import httpx
 import json
@@ -79,7 +79,7 @@ _DEFAULT_SETTINGS = {
     "puter_token": "",
     "puter_models": [
         {"name": "openai/gpt-5-nano", "context": 1047576},
-        {"name": "anthropic/claude-haiku-4.5", "context": 200000},
+        {"name": "openai/gpt-5.4", "context": 1047576},
         {"name": "google/gemini-2.5-flash", "context": 1048576},
         {"name": "deepseek/deepseek-v3.2", "context": 131072},
         {"name": "mistralai/devstral-2512", "context": 131072},
@@ -7341,8 +7341,8 @@ Settings: ~/.tooncode/settings.json
     "auto_approve": true
   }
   Get token: sign up at https://puter.com -> Developer Console -> puter.authToken
-  Models: openai/gpt-5-nano, anthropic/claude-haiku-4.5, google/gemini-2.5-flash,
-          deepseek/deepseek-v3.2, mistralai/devstral-2512, and 500+ more
+  Models: openai/gpt-5-nano, openai/gpt-5.4, google/gemini-2.5-flash,
+          deepseek/deepseek-v3.2, mistralai/devstral-2512
 
 More info: https://www.npmjs.com/package/@votadev/tooncode""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
