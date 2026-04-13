@@ -17,9 +17,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/votalab/tooncode.git"
+    "url": "git+https://github.com/votadev/tooncode.git"
   },
-  "homepage": "https://github.com/votalab/tooncode#readme",
+  "homepage": "https://github.com/votadev/tooncode#readme",
   "bin": {
     "tooncode": "bin/tooncode.js"
   },
