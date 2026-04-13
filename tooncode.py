@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.4.0"
+VERSION = "2.5.1"
 
 import httpx
 import json
@@ -75,6 +75,15 @@ _DEFAULT_SETTINGS = {
     ],
     "auto_approve": True,
     "theme": "default",
+    "api_provider": "",  # "" = default (opencode), "puter" = Puter.com
+    "puter_token": "",
+    "puter_models": [
+        {"name": "openai/gpt-5-nano", "context": 1047576},
+        {"name": "anthropic/claude-haiku-4.5", "context": 200000},
+        {"name": "google/gemini-2.5-flash", "context": 1048576},
+        {"name": "deepseek/deepseek-v3.2", "context": 131072},
+        {"name": "mistralai/devstral-2512", "context": 131072},
+    ],
 }
 # Per-model settings example in settings.json:
 # {"name": "claude-sonnet", "context": 200000, "api_url": "https://api.anthropic.com/v1/messages", "api_key": "sk-ant-..."}
@@ -120,6 +129,21 @@ def _save_settings(settings: dict):
 _settings = _load_settings()
 API_URL = _settings["api_url"]
 API_KEY = _settings.get("api_key", "public")
+
+# If provider is puter, use puter models
+if _settings.get("api_provider", "").lower() == "puter":
+    _puter_models = _settings.get("puter_models", []) + _settings.get("models", [])
+    # Deduplicate by name
+    _seen = set()
+    _deduped = []
+    for m in _puter_models:
+        if m["name"] not in _seen:
+            _deduped.append(m)
+            _seen.add(m["name"])
+    _settings["models"] = _deduped
+    if _settings.get("default_model", "minimax-m2.5-free") == "minimax-m2.5-free":
+        _settings["default_model"] = "openai/gpt-5-nano"
+
 MODEL = _settings["default_model"]
 AVAILABLE_MODELS = [m["name"] for m in _settings["models"]]
 
@@ -139,6 +163,130 @@ def _get_api_key() -> str:
     """Get API key for current model (per-model or global)."""
     cfg = _get_model_config(MODEL)
     return cfg.get("api_key", API_KEY)
+
+def _is_puter() -> bool:
+    """Check if current API provider is Puter."""
+    return _settings.get("api_provider", "").lower() == "puter"
+
+def _get_puter_token() -> str:
+    """Get Puter auth token from settings."""
+    return _settings.get("puter_token", "")
+
+def _convert_to_openai_messages(messages: list) -> list:
+    """Convert Anthropic-format messages to OpenAI-format messages."""
+    result = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        # String content — pass through
+        if isinstance(content, str):
+            result.append({"role": role, "content": content})
+            continue
+
+        # List of content blocks (Anthropic format)
+        if isinstance(content, list):
+            # Check if it contains tool_result blocks
+            tool_results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+            if tool_results:
+                for tr in tool_results:
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": tr.get("tool_use_id", ""),
+                        "content": tr.get("content", "") if isinstance(tr.get("content"), str) else json.dumps(tr.get("content", "")),
+                    })
+                continue
+
+            # Check if assistant message with tool_use blocks
+            tool_uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+            text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+            text_combined = "\n".join(t for t in text_parts if t)
+
+            if tool_uses:
+                tool_calls = []
+                for tu in tool_uses:
+                    tool_calls.append({
+                        "id": tu.get("id", _gen_id("call", 24)),
+                        "type": "function",
+                        "function": {
+                            "name": tu.get("name", ""),
+                            "arguments": json.dumps(tu.get("input", {})),
+                        }
+                    })
+                msg_out = {"role": "assistant", "tool_calls": tool_calls}
+                if text_combined:
+                    msg_out["content"] = text_combined
+                result.append(msg_out)
+                continue
+
+            # Plain text blocks
+            if text_combined:
+                result.append({"role": role, "content": text_combined})
+            elif content:
+                # Fallback: stringify
+                result.append({"role": role, "content": json.dumps(content)})
+    return result
+
+def _convert_openai_tools(tools: list) -> list:
+    """Convert Anthropic tool definitions to OpenAI function format."""
+    result = []
+    for tool in tools:
+        result.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {}),
+            }
+        })
+    return result
+
+def _convert_from_openai_response(data: dict) -> dict:
+    """Convert OpenAI chat completion response to Anthropic-format response."""
+    content = []
+    stop_reason = "end_turn"
+
+    choices = data.get("choices", [])
+    if not choices:
+        return {"content": [{"type": "text", "text": "(empty response)"}], "stop_reason": stop_reason}
+
+    choice = choices[0]
+    finish = choice.get("finish_reason", "stop")
+    if finish == "tool_calls":
+        stop_reason = "tool_use"
+    elif finish == "length":
+        stop_reason = "max_tokens"
+
+    message = choice.get("message", {})
+
+    # Text content
+    if message.get("content"):
+        content.append({"type": "text", "text": message["content"]})
+
+    # Tool calls
+    for tc in message.get("tool_calls", []):
+        fn = tc.get("function", {})
+        try:
+            args = json.loads(fn.get("arguments", "{}"))
+        except (json.JSONDecodeError, Exception):
+            args = {}
+        content.append({
+            "type": "tool_use",
+            "id": tc.get("id", _gen_id("toolu", 24)),
+            "name": fn.get("name", ""),
+            "input": args,
+        })
+
+    usage = data.get("usage", {})
+    return {
+        "content": content,
+        "stop_reason": stop_reason,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        }
+    }
+
 def _gen_id(prefix: str, length: int = 24) -> str:
     """Generate IDs matching OpenCode format: prefix + hex + mixed alphanumeric."""
     chars = string.ascii_letters + string.digits
@@ -161,20 +309,44 @@ HEADERS = {
     "Accept-Encoding": "identity",
 }
 
-# Rich theme
-THEME = Theme({
-    "user": "bold green",
-    "assistant": "bold cyan",
+# ============================================================================
+# PROFESSIONAL NEON DARK THEME + REALTIME UI
+# ============================================================================
+
+PROFESSIONAL_THEME = Theme({
+    "primary": "#00f5ff",      # Cyan Neon
+    "accent": "#ff00aa",       # Pink Neon
+    "success": "#00ff9d",
+    "warning": "#ffd700",
+    "error": "#ff2a6d",
+    "status": "#00f5ff bold",
+    "panel.border": "#00f5ff",
+    "panel.title": "#ffffff bold",
+    "chat.user": "#00ff9d bold",
+    "chat.assistant": "#00f5ff bold",
+    "tool.name": "#ff00aa bold",
     "thinking": "dim italic",
-    "tool.name": "bold yellow",
     "tool.result": "dim",
-    "error": "bold red",
     "info": "dim cyan",
-    "status": "bold",
     "model.name": "bold magenta",
+    "user": "#00ff9d bold",
+    "assistant": "#00f5ff bold",
+    "dim": "#8888aa",
 })
 
-console = Console(theme=THEME)
+console = Console(theme=PROFESSIONAL_THEME)
+
+
+def make_thai_flag_small():
+    """Small Thai flag decoration for banner."""
+    flag = Text()
+    flag.append("██", style="bold red")
+    flag.append("██", style="white")
+    flag.append("██", style="bold #0033A0")
+    flag.append("██", style="white")
+    flag.append("██", style="bold red")
+    return flag
+
 
 # Stats
 total_input_tokens = 0
@@ -618,6 +790,612 @@ def _load_cached_index() -> bool:
     return False
 
 
+# ============================================================================
+# Advanced Project Init — Deep project understanding
+# ============================================================================
+
+
+def _detect_tech_stack() -> str:
+    """Detect tech stack in detail."""
+    stack = []
+    files = os.listdir(CWD)
+
+    # Python
+    req_path = os.path.join(CWD, "requirements.txt")
+    if any(f in files for f in ["requirements.txt", "pyproject.toml", "setup.py", "Pipfile"]):
+        stack.append("Python")
+        if os.path.exists(req_path):
+            try:
+                with open(req_path, encoding="utf-8") as f:
+                    req_content = f.read().lower()
+                if "fastapi" in req_content: stack.append("FastAPI")
+                elif "flask" in req_content: stack.append("Flask")
+                elif "django" in req_content: stack.append("Django")
+                if "sqlalchemy" in req_content: stack.append("SQLAlchemy")
+                if "celery" in req_content: stack.append("Celery")
+                if "pytest" in req_content: stack.append("pytest")
+            except Exception:
+                pass
+
+    # Node.js / TypeScript
+    if "package.json" in files:
+        try:
+            with open(os.path.join(CWD, "package.json"), encoding="utf-8") as f:
+                pkg = json.load(f)
+            deps = list(pkg.get("dependencies", {}).keys()) + list(pkg.get("devDependencies", {}).keys())
+            if "typescript" in deps or "tsconfig.json" in files:
+                stack.append("TypeScript")
+            else:
+                stack.append("Node.js")
+            if any("next" in d for d in deps): stack.append("Next.js")
+            elif any("nuxt" in d for d in deps): stack.append("Nuxt.js")
+            elif any("react" in d for d in deps): stack.append("React")
+            elif any("vue" in d for d in deps): stack.append("Vue.js")
+            elif any("angular" in d for d in deps): stack.append("Angular")
+            elif any("svelte" in d for d in deps): stack.append("Svelte")
+            if any("express" in d for d in deps): stack.append("Express")
+            if any("prisma" in d for d in deps): stack.append("Prisma")
+            if any("drizzle" in d for d in deps): stack.append("Drizzle ORM")
+            if any("tailwind" in d for d in deps): stack.append("Tailwind CSS")
+            if any("vitest" in d for d in deps): stack.append("Vitest")
+            elif any("jest" in d for d in deps): stack.append("Jest")
+            if any("trpc" in d for d in deps): stack.append("tRPC")
+            if any("supabase" in d for d in deps): stack.append("Supabase")
+        except Exception:
+            stack.append("Node.js")
+
+    # Other languages
+    if "Cargo.toml" in files: stack.append("Rust")
+    if "go.mod" in files: stack.append("Go")
+    if any(f.endswith(".csproj") or f.endswith(".sln") for f in files): stack.append(".NET")
+    if "pubspec.yaml" in files: stack.append("Flutter / Dart")
+    if "composer.json" in files: stack.append("PHP")
+    if "Gemfile" in files: stack.append("Ruby")
+    if "build.gradle" in files or "pom.xml" in files: stack.append("Java")
+
+    # Infrastructure
+    if "Dockerfile" in files or "docker-compose.yml" in files: stack.append("Docker")
+    if ".github" in files: stack.append("GitHub Actions")
+    if "vercel.json" in files: stack.append("Vercel")
+    if "netlify.toml" in files: stack.append("Netlify")
+
+    return " + ".join(stack) if stack else "Unknown / Custom"
+
+
+def _find_important_files() -> dict:
+    """Find important project files automatically."""
+    patterns = {
+        "README.md": "Project documentation",
+        "package.json": "Node.js project config",
+        "tsconfig.json": "TypeScript config",
+        "requirements.txt": "Python dependencies",
+        "pyproject.toml": "Python project config",
+        "setup.py": "Python package config",
+        "Cargo.toml": "Rust project config",
+        "go.mod": "Go module file",
+        "docker-compose.yml": "Docker services",
+        "Dockerfile": "Container build",
+        ".env.example": "Environment variables template",
+        "prisma/schema.prisma": "Database schema (Prisma)",
+        "app/layout.tsx": "Next.js root layout",
+        "app/page.tsx": "Next.js home page",
+        "src/main.py": "Python entry point",
+        "src/app.py": "Python app entry point",
+        "main.py": "Python entry point",
+        "index.js": "Node.js entry point",
+        "index.ts": "TypeScript entry point",
+        "src/index.ts": "TypeScript entry point",
+        "src/App.tsx": "React main component",
+        "src/main.ts": "Vue/Vite entry point",
+        "manage.py": "Django management",
+        "alembic.ini": "Database migrations config",
+    }
+    result = {}
+    for pattern, desc in patterns.items():
+        full = os.path.join(CWD, pattern)
+        if os.path.exists(full):
+            rel = pattern.replace("\\", "/")
+            result[rel] = desc
+        else:
+            # Try glob for nested matches
+            matches = glob_mod.glob(os.path.join(CWD, "**", os.path.basename(pattern)), recursive=True)
+            for m in matches[:2]:
+                rel = os.path.relpath(m, CWD).replace("\\", "/")
+                if rel not in result and ".git" not in rel and "node_modules" not in rel:
+                    result[rel] = desc
+    return result
+
+
+def _call_model_for_summary(prompt: str) -> str:
+    """Call current model for project summary."""
+    body = {
+        "model": MODEL,
+        "max_tokens": 2000,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+        "stream": False,
+    }
+    if MODEL not in NO_SAMPLING_PARAMS:
+        body["temperature"] = 0.7
+
+    headers = dict(HEADERS)
+    headers["x-api-key"] = API_KEY
+    headers["anthropic-version"] = "2023-06-01"
+
+    with httpx.Client(timeout=90.0) as client:
+        resp = client.post(_get_current_api_url(), headers=headers, json=body)
+        if resp.status_code == 200:
+            data = resp.json()
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    return block.get("text", "")
+    return "AI summary generation failed."
+
+
+def _advanced_init() -> str:
+    """Create TOONCODE.md with deep project understanding."""
+    console.print("[bold cyan]Starting Advanced Project Analysis...[/bold cyan]")
+
+    # 1. Build codebase index if not exists
+    if not _codebase_index:
+        console.print("[dim]Scanning project structure...[/dim]")
+        _build_codebase_index()
+
+    # 2. Detect tech stack
+    console.print("[dim]Detecting tech stack...[/dim]")
+    tech_stack = _detect_tech_stack()
+    console.print(f"[dim]  Stack: {tech_stack}[/dim]")
+
+    # 3. Find and read important files
+    console.print("[dim]Finding important files...[/dim]")
+    important_files = _find_important_files()
+    file_summaries = {}
+    for fpath, desc in important_files.items():
+        try:
+            full_path = os.path.join(CWD, fpath)
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(3000)
+            file_summaries[fpath] = {"description": desc, "preview": content[:1200]}
+            console.print(f"[dim]  + {fpath}[/dim]")
+        except Exception:
+            file_summaries[fpath] = {"description": desc, "preview": "(could not read)"}
+
+    # 4. Read README
+    readme_content = ""
+    readme_path = os.path.join(CWD, "README.md")
+    if os.path.exists(readme_path):
+        try:
+            with open(readme_path, "r", encoding="utf-8") as f:
+                readme_content = f.read()[:3000]
+        except Exception:
+            pass
+
+    # 5. Build AI analysis prompt
+    file_info = "\n".join(f"- {k}: {v['description']}" for k, v in file_summaries.items())
+    analysis_prompt = f"""You are an expert software architect. Analyze this project and create a deep, accurate understanding.
+
+Project directory: {CWD}
+
+Codebase structure:
+{_codebase_index[:3000] if _codebase_index else '(not available)'}
+
+Tech stack: {tech_stack}
+
+Important files found:
+{file_info}
+
+README.md (first 3000 chars):
+{readme_content if readme_content else '(no README)'}
+
+Create a comprehensive project overview for an AI coding agent.
+Focus on:
+- What this project actually does (purpose, domain)
+- Architecture & main patterns used
+- Key business logic / domain concepts
+- Important files and their roles
+- Coding style & conventions observed
+- Things the AI must remember when editing code
+
+Answer in Thai, be clear, natural, and detailed."""
+
+    # 6. Call AI for summary
+    console.print("[dim]Asking AI to deeply understand the project...[/dim]")
+    try:
+        summary = _call_model_for_summary(analysis_prompt)
+    except Exception as e:
+        summary = f"AI summary generation failed: {e}"
+
+    # 7. Build TOONCODE.md content
+    project_name = os.path.basename(CWD)
+    content = f"""# {project_name} - Project Context for ToonCode
+
+**Generated by ToonCode Advanced Init** — {datetime.now().strftime('%d %b %Y %H:%M')}
+
+## 1. Project Overview
+{summary}
+
+## 2. Tech Stack
+{tech_stack}
+
+## 3. Architecture & Folder Structure
+```
+{_codebase_index[:5000] if _codebase_index else '(run /index to generate)'}
+```
+
+## 4. Key Files & Their Purpose
+
+"""
+    for fpath, info in file_summaries.items():
+        content += f"### `{fpath}`\n{info['description']}\n\n"
+
+    # Import from other AI config files
+    _import_files = [
+        ("CLAUDE.md", "Boss AI"), (".claude/CLAUDE.md", "Boss AI"),
+        ("GEMINI.md", "Gemini"), (".cursorrules", "Cursor"),
+        (".cursor/rules", "Cursor"), ("COPILOT.md", "Copilot"),
+    ]
+    imported_content = ""
+    for fname, source in _import_files:
+        fpath = os.path.join(CWD, fname)
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    imported_text = f.read().strip()
+                if imported_text:
+                    imported_content += f"\n\n## Imported from {source} ({fname})\n{imported_text[:2000]}"
+                    console.print(f"[dim]  Imported from {source}: {fname}[/dim]")
+            except Exception:
+                pass
+
+    content += """
+## 5. AI Coding Guidelines
+- Read this file before working on the project
+- Always use absolute paths
+- Read files before editing with `read` tool
+- Use `edit` or `multi_edit` for modifications
+- Don't add features not in the spec
+- Follow the project's existing coding style
+- Write clean, maintainable code
+
+## 6. Notes / Recent Decisions
+(Add important notes here)
+"""
+    if imported_content:
+        content += imported_content
+
+    content += f"\n\n---\n**Use `/init force` to regenerate**\n"
+
+    # 8. Write file
+    md_path = os.path.join(CWD, "TOONCODE.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    console.print(f"[bold green]Created TOONCODE.md with deep project understanding[/bold green]")
+    console.print(f"[dim]   -> {md_path}[/dim]")
+    return "Advanced initialization completed. TOONCODE.md created."
+
+
+# ============================================================================
+# Semantic Code Search — LanceDB vector search
+# ============================================================================
+
+_lance_db = None
+_lance_table = None
+_semantic_available = False
+
+try:
+    import lancedb
+    _semantic_available = True
+except ImportError:
+    pass
+
+# Backward compat alias
+_chroma_available = _semantic_available
+
+
+def _init_lance():
+    """Initialize LanceDB with persistent storage."""
+    global _lance_db, _lance_table
+    if not _semantic_available:
+        return False
+    if _lance_table is not None:
+        return True
+    try:
+        db_path = os.path.join(os.path.expanduser("~"), ".tooncode", "lance_db")
+        os.makedirs(db_path, exist_ok=True)
+        _lance_db = lancedb.connect(db_path)
+        # Check if table exists for this project
+        proj_hash = hashlib.md5(CWD.encode()).hexdigest()[:12]
+        table_name = f"tooncode_{proj_hash}"
+        if table_name in _lance_db.table_names():
+            _lance_table = _lance_db.open_table(table_name)
+        return True
+    except Exception as e:
+        console.print(f"[dim]LanceDB init failed: {e}[/dim]")
+        return False
+
+
+def _simple_embed(text: str) -> list:
+    """Embedding using word n-grams + code-aware tokens. Fast, no GPU needed."""
+    text_lower = text.lower()
+
+    # Extract meaningful tokens: identifiers, keywords, strings
+    words = re.findall(r'[a-z_][a-z0-9_]{1,}', text_lower)
+
+    # Split camelCase and snake_case into sub-tokens
+    expanded = []
+    for w in words:
+        # snake_case split
+        parts = w.split("_")
+        for p in parts:
+            if p:
+                expanded.append(p)
+                # camelCase split
+                sub = re.findall(r'[a-z]+', p)
+                if len(sub) > 1:
+                    expanded.extend(sub)
+    words = expanded
+
+    # Create a 384-dim embedding based on hash buckets
+    dim = 384
+    vec = [0.0] * dim
+
+    # Word-level features (strongest signal)
+    seen_words = set()
+    for w in words:
+        if len(w) < 2:
+            continue
+        idx = hash(w) % dim
+        # TF-like: first occurrence counts more
+        if w not in seen_words:
+            vec[idx] += 2.0
+            seen_words.add(w)
+        else:
+            vec[idx] += 0.3
+
+    # Bigram features (word pairs capture context)
+    for i in range(len(words) - 1):
+        if len(words[i]) < 2 or len(words[i+1]) < 2:
+            continue
+        bigram = f"{words[i]}_{words[i+1]}"
+        idx = hash(bigram) % dim
+        vec[idx] += 1.0
+
+    # Code structure signals
+    structure_signals = {
+        "def ": 5, "class ": 5, "function ": 5, "import ": 3, "from ": 3,
+        "return ": 3, "if ": 2, "for ": 2, "while ": 2, "try:": 2,
+        "async ": 3, "await ": 3, "export ": 3, "const ": 2, "let ": 2,
+        "interface ": 4, "type ": 3, "struct ": 4, "impl ": 4,
+        "SELECT ": 4, "INSERT ": 4, "CREATE ": 4, "ALTER ": 4,
+        "http": 3, "api": 3, "route": 3, "handler": 3, "middleware": 3,
+        "database": 3, "query": 3, "model": 3, "schema": 3,
+        "test": 3, "assert": 3, "mock": 3, "expect": 3,
+        "error": 3, "exception": 3, "catch": 3, "throw": 3,
+        "render": 3, "component": 3, "template": 3, "view": 3,
+        "config": 3, "setting": 3, "env": 3, "secret": 3,
+        "auth": 4, "login": 4, "token": 4, "session": 4, "permission": 4,
+        "stream": 3, "socket": 3, "channel": 3, "message": 3,
+        "file": 3, "read": 3, "write": 3, "path": 3,
+    }
+    for signal, weight in structure_signals.items():
+        if signal in text_lower:
+            idx = hash(f"__signal_{signal}") % dim
+            vec[idx] += weight
+
+    # Normalize to unit vector
+    magnitude = sum(v * v for v in vec) ** 0.5
+    if magnitude > 0:
+        vec = [v / magnitude for v in vec]
+
+    return vec
+
+
+def _index_codebase_semantic():
+    """Index all code files into LanceDB for semantic search."""
+    global _lance_table
+    if not _semantic_available:
+        return "LanceDB not available. Install with: pip install lancedb"
+    if not _init_lance():
+        return "LanceDB initialization failed."
+
+    console.print("[dim]Indexing codebase for semantic search...[/dim]")
+
+    code_exts = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".rb",
+                 ".php", ".c", ".cpp", ".h", ".cs", ".swift", ".kt", ".scala",
+                 ".html", ".css", ".scss", ".vue", ".svelte", ".sql", ".sh", ".bat",
+                 ".yaml", ".yml", ".toml", ".json", ".md", ".txt"}
+
+    skip_dirs = {".git", "node_modules", "__pycache__", ".next", "dist", "build",
+                 "venv", ".venv", "env", ".env", "vendor", "target", ".tooncode"}
+
+    records = []
+    doc_id = 0
+
+    for root, dirs, files_list in os.walk(CWD):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+
+        for fname in files_list:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in code_exts:
+                continue
+            fpath = os.path.join(root, fname)
+            rel_path = os.path.relpath(fpath, CWD).replace("\\", "/")
+
+            try:
+                size = os.path.getsize(fpath)
+                if size > 500_000 or size == 0:
+                    continue
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            chunks = _split_into_chunks(content, rel_path, ext)
+
+            for i, chunk in enumerate(chunks):
+                if len(chunk.strip()) < 20:
+                    continue
+                doc_id += 1
+                vec = _simple_embed(chunk)
+                records.append({
+                    "id": f"doc_{doc_id}",
+                    "text": chunk[:2000],
+                    "file": rel_path,
+                    "chunk_index": i,
+                    "ext": ext,
+                    "vector": vec,
+                })
+
+    if not records:
+        return "No code files found to index."
+
+    try:
+        import pyarrow as pa
+        proj_hash = hashlib.md5(CWD.encode()).hexdigest()[:12]
+        table_name = f"tooncode_{proj_hash}"
+
+        # Drop old table if exists
+        if table_name in _lance_db.table_names():
+            _lance_db.drop_table(table_name)
+
+        _lance_table = _lance_db.create_table(table_name, records)
+        console.print(f"[green]Indexed {len(records)} code chunks[/green]")
+        return f"Indexed {len(records)} code chunks for semantic search."
+    except Exception as e:
+        return f"Indexing failed: {e}"
+
+
+def _split_into_chunks(content: str, filepath: str, ext: str) -> list:
+    """Split file content into meaningful chunks for embedding."""
+    lines = content.split("\n")
+
+    # For Python: split by functions/classes
+    if ext == ".py":
+        return _split_python_chunks(lines)
+    # For JS/TS: split by functions/classes
+    elif ext in (".js", ".ts", ".tsx", ".jsx"):
+        return _split_js_chunks(lines)
+    # For other code: split by ~30 line blocks
+    elif ext in (".java", ".go", ".rs", ".c", ".cpp", ".cs", ".rb", ".php"):
+        return _split_by_lines(lines, 30)
+    # For docs/config: split by sections or paragraphs
+    else:
+        return _split_by_lines(lines, 40)
+
+
+def _split_python_chunks(lines: list) -> list:
+    """Split Python code by functions and classes."""
+    chunks = []
+    current = []
+    for line in lines:
+        stripped = line.lstrip()
+        if (stripped.startswith("def ") or stripped.startswith("class ") or
+                stripped.startswith("async def ")):
+            if current:
+                chunks.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        chunks.append("\n".join(current))
+    # Merge very small chunks
+    return _merge_small_chunks(chunks, min_size=50)
+
+
+def _split_js_chunks(lines: list) -> list:
+    """Split JS/TS code by functions and components."""
+    chunks = []
+    current = []
+    for line in lines:
+        stripped = line.lstrip()
+        if (stripped.startswith("function ") or stripped.startswith("export ") or
+                stripped.startswith("const ") and ("=>" in line or "function" in line) or
+                stripped.startswith("class ")):
+            if current and len("\n".join(current)) > 50:
+                chunks.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        chunks.append("\n".join(current))
+    return _merge_small_chunks(chunks, min_size=50)
+
+
+def _split_by_lines(lines: list, chunk_size: int = 30) -> list:
+    """Split by fixed line count with overlap."""
+    chunks = []
+    for i in range(0, len(lines), chunk_size - 5):  # 5 line overlap
+        chunk = "\n".join(lines[i:i+chunk_size])
+        if chunk.strip():
+            chunks.append(chunk)
+    return chunks
+
+
+def _merge_small_chunks(chunks: list, min_size: int = 50) -> list:
+    """Merge chunks smaller than min_size with their neighbor."""
+    if not chunks:
+        return chunks
+    merged = []
+    buffer = ""
+    for chunk in chunks:
+        if len(chunk) < min_size:
+            buffer += "\n" + chunk
+        else:
+            if buffer:
+                merged.append(buffer.strip())
+                buffer = ""
+            merged.append(chunk)
+    if buffer:
+        if merged:
+            merged[-1] += "\n" + buffer
+        else:
+            merged.append(buffer.strip())
+    return merged
+
+
+def exec_semantic_search(args: dict) -> str:
+    """Semantic search across the codebase using LanceDB."""
+    if not _semantic_available:
+        return "LanceDB not installed. Run: pip install lancedb"
+
+    query = args.get("query", "")
+    n_results = int(args.get("n_results", 5))
+
+    if not query:
+        return "Please provide a search query."
+
+    if not _init_lance():
+        return "LanceDB initialization failed."
+
+    # Auto-index if no table
+    if _lance_table is None:
+        console.print("[dim]No index found. Building semantic index...[/dim]")
+        _index_codebase_semantic()
+
+    if _lance_table is None:
+        return "No code indexed. No files found to search."
+
+    try:
+        query_vec = _simple_embed(query)
+        results = _lance_table.search(query_vec).limit(min(n_results, 10)).to_list()
+
+        if not results:
+            return f"No results found for: {query}"
+
+        output = []
+        for i, row in enumerate(results):
+            score = 1.0 - row.get("_distance", 0)  # cosine similarity
+            fpath = row.get("file", "?")
+            text = row.get("text", "")
+            output.append(f"--- [{i+1}] {fpath} (score: {score:.3f}) ---")
+            output.append(text[:500])
+            output.append("")
+
+        return "\n".join(output)
+    except Exception as e:
+        return f"Search failed: {e}"
+
+
 # Context window sizes per model
 # Build from settings
 CONTEXT_WINDOWS = {m["name"]: m.get("context", 200_000) for m in _settings["models"]}
@@ -705,7 +1483,7 @@ This helps the user track your progress.
 
 # Getting help when stuck
 If you encounter a bug or error you cannot solve after 2 attempts, use the `bosshelp` tool.
-It sends your problem to Claude Code (a more powerful AI) which will give you the exact solution.
+It sends your problem to Boss AI (a more powerful AI) which will give you the exact solution.
 Always include: the problem, what you tried, the code, and the error message.
 After getting the answer, APPLY THE FIX IMMEDIATELY and continue working. Never stop."""
 
@@ -881,7 +1659,7 @@ TOOLS = [
     },
     {
         "name": "bosshelp",
-        "description": "CALL THIS when you are STUCK, hit an error you can't fix, or need expert help. Sends your problem to Claude Code (a more powerful AI) which will analyze and give you the exact solution. Always include the error message and relevant code.",
+        "description": "CALL THIS when you are STUCK, hit an error you can't fix, or need expert help. Sends your problem to Boss AI (a more powerful AI) which will analyze and give you the exact solution. Always include the error message and relevant code.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1047,6 +1825,18 @@ TOOLS = [
                 "wait": {"type": "number", "description": "Wait seconds after action (default 1)"},
             },
             "required": ["action"],
+        },
+    },
+    {
+        "name": "semantic_search",
+        "description": "Semantic code search — find code by meaning, not just keywords. Uses AI embeddings + ChromaDB vector database. Much smarter than grep for finding related code, similar patterns, or answering 'where is the code that handles X?'. Auto-indexes on first use.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language query describing what you're looking for (e.g., 'user authentication logic', 'database connection setup', 'error handling for API calls')"},
+                "n_results": {"type": "number", "description": "Number of results to return (default 5, max 10)"},
+            },
+            "required": ["query"],
         },
     },
 ]
@@ -2327,18 +3117,32 @@ You are a sub-agent. Complete the task and report your result concisely."""
             if time.time() - agent_start > AGENT_TIMEOUT:
                 all_output.append(f"\n[agent timed out after {AGENT_TIMEOUT}s]")
                 break
-            body = {
-                "model": MODEL,
-                "max_tokens": 16000,
-                "system": [{"type": "text", "text": system}],
-                "messages": messages,
-                "tools": _SUBAGENT_TOOLS,
-                "tool_choice": {"type": "auto"},
-                "stream": False,
-            }
+            if _is_puter():
+                oai_msgs = [{"role": "system", "content": system}] + _convert_to_openai_messages(messages)
+                oai_tools = _convert_openai_tools(_SUBAGENT_TOOLS)
+                body = {
+                    "model": MODEL,
+                    "max_tokens": 16000,
+                    "messages": oai_msgs,
+                    "tools": oai_tools if oai_tools else None,
+                    "tool_choice": "auto" if oai_tools else None,
+                    "stream": False,
+                }
+                body = {k: v for k, v in body.items() if v is not None}
+            else:
+                body = {
+                    "model": MODEL,
+                    "max_tokens": 16000,
+                    "system": [{"type": "text", "text": system}],
+                    "messages": messages,
+                    "tools": _SUBAGENT_TOOLS,
+                    "tool_choice": {"type": "auto"},
+                    "stream": False,
+                }
             if MODEL not in NO_SAMPLING_PARAMS:
-                body["temperature"] = 1
-                body["top_k"] = 40
+                body["temperature"] = 1 if not _is_puter() else 0.7
+                if not _is_puter():
+                    body["top_k"] = 40
                 body["top_p"] = 0.95
 
             with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
@@ -2346,6 +3150,8 @@ You are a sub-agent. Complete the task and report your result concisely."""
                 if resp.status_code != 200:
                     return f"[agent error: HTTP {resp.status_code}]"
                 data = resp.json()
+                if _is_puter():
+                    data = _convert_from_openai_response(data)
 
             content = data.get("content", [])
             if not content:
@@ -2400,209 +3206,843 @@ You are a sub-agent. Complete the task and report your result concisely."""
 
 
 # ============================================================================
-# Team Mode — multiple agents working together autonomously
+# Team Mode — multiple agents working together autonomously (v2)
 # ============================================================================
 
 _TEAM_ROLES = {
+    # === General-Purpose Roles (ใช้ได้กับทุกงาน) ===
     "planner": {
         "emoji": "📋",
+        "name": "สมชาย",
         "color": "cyan",
         "system": """You are the PLANNER. Your job:
 1. Read the task and break it into clear steps
-2. Use glob/read to understand the project
-3. Write a plan and assign work to other agents via the channel
-4. Send messages like: "@coder create index.html with ..." or "@tester write tests for ..."
-Always start by reading existing files. Output a numbered plan.""",
+2. Understand the context — if it's a coding task, read project files. If it's research/writing/analysis, plan the approach.
+3. Assign work to other agents via the channel using JSON:
+   {"type":"assignment","to":"<role>","task":"<description>","priority":1}
+4. You can also send plain text messages with @role mentions
+5. Use team_task_create to add tasks to the shared task board
+6. If you need a specialist not on the team, use spawn_team_agent to create one
+Always analyze the task type first. Output a numbered plan, then send JSON assignments.""",
     },
+    "supervisor": {
+        "emoji": "🧠",
+        "name": "สุภาพร",
+        "color": "bright_cyan",
+        "system": """You are the SUPERVISOR. You do NOT do the work yourself. Your job:
+1. Monitor the team's progress by reading channel messages and the task board
+2. Use team_task_list to check task progress regularly
+3. If an agent is stuck or slow, reassign their task or send guidance
+4. If you detect a conflict (2 agents working on the same thing), intervene
+5. If you need a specialist, use spawn_team_agent to create one dynamically
+6. Summarize overall progress periodically
+7. When all tasks are done, send a final summary to the channel
+Be concise. Focus on coordination, not execution.""",
+    },
+
+    # === Coding Roles ===
     "frontend": {
         "emoji": "🎨",
+        "name": "ณัฐพล",
         "color": "green",
         "system": """You are the FRONTEND agent. You build UI: HTML, CSS, JS, React, etc.
 Read channel messages for your assignments. When done, send results back.
 Use write/edit tools. Always read files before editing.
+Use team_task_update to mark your tasks as done on the task board.
 Send "@reviewer please check my frontend code" when done.""",
     },
     "backend": {
         "emoji": "⚙️",
+        "name": "วิชัย",
         "color": "yellow",
         "system": """You are the BACKEND agent. You build APIs, databases, server logic.
 Read channel messages for your assignments. When done, send results back.
 Use write/edit/bash tools. Always read files before editing.
+Use team_task_update to mark your tasks as done on the task board.
 Send "@tester please test the API" when done.""",
     },
     "reviewer": {
         "emoji": "🔍",
+        "name": "มาลี",
         "color": "magenta",
         "system": """You are the REVIEWER. Read code written by other agents, find bugs, fix them.
 Read channel messages. When asked to review, read the files and check.
 Use edit tool to fix issues directly. Report: PASS or list of fixes.
+Use team_task_update to mark your tasks as done on the task board.
 Send results back to channel.""",
     },
     "tester": {
         "emoji": "🧪",
+        "name": "ธนา",
         "color": "red",
         "system": """You are the TESTER. Write and run tests for code written by other agents.
 Read channel messages for test requests. Write test files, run with bash.
+Use team_task_update to mark your tasks as done on the task board.
 Report results back to channel. If tests fail, send "@coder fix: ..." """,
+    },
+
+    # === Research & Knowledge Roles ===
+    "researcher": {
+        "emoji": "🔬",
+        "name": "ปิยะ",
+        "color": "bright_blue",
+        "system": """You are the RESEARCHER. Your job is to find information, gather data, and provide facts.
+Use web_search and web_fetch to find information online.
+Use read/glob to find information in local files.
+Summarize your findings clearly with sources.
+Use team_task_update to mark your tasks as done on the task board.
+Send results back to the channel when done.""",
+    },
+    "analyst": {
+        "emoji": "📊",
+        "name": "นภา",
+        "color": "bright_yellow",
+        "system": """You are the ANALYST. Your job is to analyze data, compare options, and provide insights.
+Read information from the channel and files.
+Organize findings into clear comparisons, pros/cons, or recommendations.
+Use bash to run scripts for data processing if needed.
+Use team_task_update to mark your tasks as done on the task board.
+Send your analysis back to the channel.""",
+    },
+
+    # === Content & Writing Roles ===
+    "writer": {
+        "emoji": "✍️",
+        "name": "กานดา",
+        "color": "bright_green",
+        "system": """You are the WRITER. Your job is to create written content: articles, docs, reports, summaries, plans, etc.
+Read channel messages for your assignments and context from other agents.
+Use write tool to create files. Use edit to revise.
+Write clearly, concisely, and in the appropriate tone for the audience.
+Use team_task_update to mark your tasks as done on the task board.
+Send "@reviewer please check my writing" when done.""",
+    },
+    "editor": {
+        "emoji": "📝",
+        "name": "อรุณ",
+        "color": "bright_magenta",
+        "system": """You are the EDITOR. Your job is to review and improve written content.
+Read files created by the writer or other agents.
+Check for: clarity, grammar, structure, tone, completeness.
+Use edit tool to fix issues directly.
+Report: APPROVED or list of changes made.
+Use team_task_update to mark your tasks as done on the task board.""",
+    },
+
+    # === Design & Creative Roles ===
+    "designer": {
+        "emoji": "🎯",
+        "name": "พิมพ์",
+        "color": "bright_red",
+        "system": """You are the DESIGNER. Your job is to design structures, layouts, architectures, and plans.
+For code: design file structure, APIs, database schemas, component architecture.
+For non-code: design outlines, frameworks, workflows, organization systems.
+Use write tool to create design documents or diagrams.
+Use team_task_update to mark your tasks as done on the task board.
+Send your design to the channel for feedback.""",
     },
 }
 
-_team_threads = []
-_team_channel = []  # shared in-memory channel for team
-_team_lock = threading.Lock()
-_team_running = False
 
+# ---------------------------------------------------------------------------
+# TeamAgent — each agent has its own context / memory / status
+# ---------------------------------------------------------------------------
+class TeamAgent:
+    """A single team agent with private context and memory."""
 
-def _team_agent_loop(role: str, task: str, agent_id: str):
-    """One team agent running autonomously."""
-    config = _TEAM_ROLES[role]
-    emoji = config["emoji"]
-    color = config["color"]
+    def __init__(self, role: str, task: str, manager: "TeamManager", custom_system: str = None):
+        config = _TEAM_ROLES.get(role, {
+            "emoji": "🤖", "color": "white",
+            "system": f"You are a custom agent with role: {role}. Do your assigned work.",
+        })
+        self.role = role
+        self.task = task
+        self.manager = manager
+        self.emoji = config["emoji"]
+        self.name = config.get("name", role)  # Thai name
+        self.color = config["color"]
+        self.agent_id = f"team-{role}-{os.getpid()}-{int(time.time())}"
+        self.messages = []  # private conversation context
+        self.memory = {"files_read": [], "files_written": [], "decisions": [], "context": {}}
+        self.status = "idle"
+        self.iteration = 0
+        self.current_task = task[:80]
+        self.last_seen = time.time()
+        self.max_iterations = 25
+        self.thread = None
+        self._system_prompt = custom_system or config["system"]
 
-    system = f"""{config['system']}
+    @property
+    def display_name(self):
+        """Thai name + role for display."""
+        return f"{self.name}({self.role})"
+
+    def get_status_dict(self):
+        return {
+            "status": self.status, "iteration": self.iteration, "name": self.name,
+            "current_task": self.current_task, "last_seen": self.last_seen,
+            "emoji": self.emoji, "color": self.color,
+        }
+
+    def _build_system(self):
+        """Build full system prompt including team context."""
+        team_roles = ", ".join(f"{a.emoji}{a.name}({a.role})" for a in self.manager.agents.values())
+        mem_summary = ""
+        if self.memory["files_read"] or self.memory["files_written"]:
+            mem_summary = f"\n\nYour memory:\n- Files read: {', '.join(self.memory['files_read'][-5:])}\n- Files written: {', '.join(self.memory['files_written'][-5:])}"
+        return f"""{self._system_prompt}
 
 Working directory: {CWD}
 Platform: {platform.system()}
-Your agent ID: {agent_id}
-Team task: {task}
+Your agent ID: {self.agent_id}
+Team task: {self.task}
+Team members: {team_roles}
 
 CHANNEL PROTOCOL:
-- Read channel messages to see what others are doing
-- Send messages with: start your text with @role to address someone
+- Send @role to address a specific agent (e.g. @frontend, @backend)
+- Send @all to broadcast to everyone
+- The planner may assign tasks via JSON: {{"type":"assignment","to":"your_role","task":"..."}}
+  Watch for assignments addressed to you and act on them
 - When you finish your part, send a summary to channel
 - ALWAYS read files before editing (another agent may have changed them)
-- Do NOT edit files that another agent is currently working on"""
+- Do NOT edit files that another agent is currently working on
 
-    messages = [{"role": "user", "content": [{"type": "text", "text":
-        f"Team task: {task}\n\nCheck the channel for your assignments. If you're the planner, create the plan first. Otherwise, wait for instructions or start on your part.\n\nChannel messages so far:\n" +
-        "\n".join(f"[{m['from']}] {m['text']}" for m in _team_channel[-20:]) if _team_channel else "(empty — you're first!)"}]}]
+AVAILABLE TEAM TOOLS:
+- team_task_create: Create a task on the shared board
+- team_task_update: Update task status (pending/in_progress/done)
+- team_task_list: View all tasks on the board
+- agent_memory_save: Save something to your private memory
+- agent_memory_recall: Recall from your private memory{mem_summary}"""
 
-    headers = make_request_headers()
-    max_iterations = 10
+    def _get_team_tools(self):
+        """Get tools available to this agent including team-specific tools."""
+        team_tools = [
+            {
+                "name": "team_task_create",
+                "description": "Create a task on the shared team task board.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Task description"},
+                        "assignee": {"type": "string", "description": "Role to assign (e.g. frontend, backend)"},
+                        "priority": {"type": "integer", "description": "Priority 1-5 (1=highest)", "default": 3},
+                    },
+                    "required": ["text"],
+                },
+            },
+            {
+                "name": "team_task_update",
+                "description": "Update a task's status on the shared board.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "Task ID (e.g. 'task-1')"},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "done"], "description": "New status"},
+                    },
+                    "required": ["task_id", "status"],
+                },
+            },
+            {
+                "name": "team_task_list",
+                "description": "List all tasks on the shared team task board.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "agent_memory_save",
+                "description": "Save a key-value pair to your private agent memory.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Memory key"},
+                        "value": {"type": "string", "description": "Value to remember"},
+                    },
+                    "required": ["key", "value"],
+                },
+            },
+            {
+                "name": "agent_memory_recall",
+                "description": "Recall all entries from your private agent memory.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ]
+        # planner and supervisor can spawn new agents
+        if self.role in ("planner", "supervisor"):
+            team_tools.append({
+                "name": "spawn_team_agent",
+                "description": "Dynamically create and start a new team agent at runtime. Max 8 agents total.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string", "description": "Role name (e.g. 'database', 'devops', or a predefined role)"},
+                        "custom_prompt": {"type": "string", "description": "Custom system prompt for the new agent (optional if using a predefined role)"},
+                    },
+                    "required": ["role"],
+                },
+            })
+        return _SUBAGENT_TOOLS + team_tools
 
-    for iteration in range(max_iterations):
-        if not _team_running:
-            break
+    def _handle_team_tool(self, name: str, inp: dict) -> str:
+        """Handle team-specific tool calls."""
+        if name == "team_task_create":
+            return self.manager.task_board_create(
+                inp.get("text", ""), assignee=inp.get("assignee"), priority=inp.get("priority", 3),
+                created_by=self.role,
+            )
+        elif name == "team_task_update":
+            return self.manager.task_board_update(inp.get("task_id", ""), inp.get("status", ""))
+        elif name == "team_task_list":
+            return self.manager.task_board_list()
+        elif name == "agent_memory_save":
+            self.memory["context"][inp.get("key", "")] = inp.get("value", "")
+            return f"Saved to memory: {inp.get('key', '')}"
+        elif name == "agent_memory_recall":
+            if not self.memory["context"]:
+                return "Memory is empty."
+            return "\n".join(f"- {k}: {v}" for k, v in self.memory["context"].items())
+        elif name == "spawn_team_agent":
+            return self.manager.spawn_agent(inp.get("role", ""), inp.get("custom_prompt"))
+        return f"[unknown team tool: {name}]"
 
-        # Inject latest channel messages
-        if iteration > 0 and _team_channel:
-            recent = [f"[{m['from']}] {m['text']}" for m in _team_channel[-10:]]
-            messages.append({"role": "user", "content": [{"type": "text", "text":
-                f"Channel update:\n" + "\n".join(recent) + "\n\nContinue your work or respond to messages."}]})
+    def run(self):
+        """Main agent execution loop."""
+        self.status = "idle"
+        self.last_seen = time.time()
 
-        try:
-            body = {
-                "model": MODEL,
-                "max_tokens": 16000,
-                "system": [{"type": "text", "text": system}],
-                "messages": messages[-12:],  # keep context manageable
-                "tools": _SUBAGENT_TOOLS,
-                "tool_choice": {"type": "auto"},
-                "stream": False,
-            }
-            if MODEL not in NO_SAMPLING_PARAMS:
-                body["temperature"] = 1
-                body["top_k"] = 40
-                body["top_p"] = 0.95
+        # Build initial message with channel context
+        recent_msgs = self.manager.get_messages(for_role=self.role, n=20)
+        channel_text = "\n".join(f"[{m['from']}] {m['text']}" for m in recent_msgs) if recent_msgs else "(empty — you're first!)"
+        self.messages = [{"role": "user", "content": [{"type": "text", "text":
+            f"Team task: {self.task}\n\nCheck the channel for your assignments. If you're the planner, create the plan first. If you're the supervisor, monitor progress. Otherwise, wait for instructions or start on your part.\n\nChannel messages so far:\n{channel_text}"}]}]
 
-            with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-                resp = client.post(_get_current_api_url(), headers=headers, json=body)
-                if resp.status_code != 200:
+        headers = make_request_headers()
+        tools = self._get_team_tools()
+        team_tool_names = {"team_task_create", "team_task_update", "team_task_list",
+                           "agent_memory_save", "agent_memory_recall", "spawn_team_agent"}
+
+        for iteration in range(self.max_iterations):
+            if not self.manager.running:
+                break
+
+            self.status = "working"
+            self.iteration = iteration + 1
+            self.last_seen = time.time()
+
+            # Inject channel updates + assignments (after first iteration)
+            if iteration > 0:
+                recent = self.manager.get_messages(for_role=self.role, n=10)
+                if recent:
+                    recent_text = "\n".join(f"[{m['from']}] {m['text']}" for m in recent)
+                    # Parse JSON assignments
+                    my_assignments = self._parse_assignments(recent)
+                    assign_text = ""
+                    if my_assignments:
+                        assign_lines = [f"  - [{a.get('priority', '?')}] {a['task']}" for a in my_assignments]
+                        assign_text = f"\n\n📌 YOUR ASSIGNMENTS:\n" + "\n".join(assign_lines)
+                        self.current_task = my_assignments[0]["task"][:80]
+                    # Add task board summary
+                    board_summary = self.manager.task_board_list()
+                    board_text = f"\n\n📋 TASK BOARD:\n{board_summary}" if "task-" in board_summary else ""
+                    self.messages.append({"role": "user", "content": [{"type": "text", "text":
+                        f"Channel update:\n{recent_text}{assign_text}{board_text}\n\nContinue your work or respond to messages."}]})
+
+            try:
+                body = {
+                    "model": MODEL,
+                    "max_tokens": 16000,
+                    "system": [{"type": "text", "text": self._build_system()}],
+                    "messages": self.messages[-12:],
+                    "tools": tools,
+                    "tool_choice": {"type": "auto"},
+                    "stream": False,
+                }
+                if MODEL not in NO_SAMPLING_PARAMS:
+                    body["temperature"] = 1
+                    body["top_k"] = 40
+                    body["top_p"] = 0.95
+
+                with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+                    resp = client.post(_get_current_api_url(), headers=headers, json=body)
+                    if resp.status_code != 200:
+                        self.status = "error"
+                        self.current_task = f"API {resp.status_code}"
+                        break
+                    data = resp.json()
+
+                content = data.get("content", [])
+                if not content:
                     break
-                data = resp.json()
 
-            content = data.get("content", [])
-            if not content:
+                # Process text output → route through manager
+                for block in content:
+                    if block.get("type") == "text" and block.get("text"):
+                        text = block["text"].strip()
+                        if text:
+                            self.manager.route_message(self.role, text)
+                            console.print(f"  [{self.color}]{self.emoji} {self.name}({self.role})[/{self.color}]: {text[:200]}")
+
+                # Process tool calls
+                tool_blocks = [b for b in content if b.get("type") == "tool_use"]
+                if not tool_blocks:
+                    # Check if this agent still has pending/in_progress tasks
+                    has_pending = False
+                    with self.manager.task_board_lock:
+                        for t in self.manager.task_board.values():
+                            if t.get("assignee") == self.role and t["status"] != "done":
+                                has_pending = True
+                                break
+                    if has_pending and iteration < self.max_iterations - 1:
+                        # Still has work — nudge agent to continue
+                        self.messages.append({"role": "assistant", "content": content})
+                        self.messages.append({"role": "user", "content": [{"type": "text", "text":
+                            "You still have unfinished tasks on the board. Please continue working on them. Use your tools to complete them."}]})
+                        time.sleep(2)
+                        continue
+                    break
+
+                self.messages.append({"role": "assistant", "content": content})
+
+                tool_results = []
+                for tb in tool_blocks:
+                    name = tb["name"]
+                    inp = tb.get("input", {})
+                    tid = tb["id"]
+
+                    if name in team_tool_names:
+                        # Team-specific tools
+                        console.print(f"  [dim]{self.emoji} {self.name} -> {name}[/dim]")
+                        result = self._handle_team_tool(name, inp)
+                    else:
+                        handler = TOOL_HANDLERS.get(name)
+                        if handler and name not in ("spawn_agent", "browser"):
+                            console.print(f"  [dim]{self.emoji} {self.name} -> {name}[/dim]")
+                            self.current_task = f"running {name}"
+                            result = handler(inp)
+                            # Track files in agent memory
+                            if name == "read" and inp.get("file_path"):
+                                fpath = inp["file_path"]
+                                if fpath not in self.memory["files_read"]:
+                                    self.memory["files_read"].append(fpath)
+                            elif name in ("write", "edit") and inp.get("file_path"):
+                                fpath = inp["file_path"]
+                                if fpath not in self.memory["files_written"]:
+                                    self.memory["files_written"].append(fpath)
+                        else:
+                            result = f"[not available for team agents: {name}]"
+                    tool_results.append({"type": "tool_result", "tool_use_id": tid, "content": str(result)[:5000]})
+
+                self.messages.append({"role": "user", "content": tool_results})
+                self.last_seen = time.time()
+                time.sleep(1)
+
+            except Exception as e:
+                self.status = "error"
+                self.current_task = str(e)[:60]
+                console.print(f"  [red]{self.emoji} {self.name}({self.role}) error: {e}[/red]")
                 break
 
-            # Process text — extract channel messages
-            for block in content:
-                if block.get("type") == "text" and block.get("text"):
-                    text = block["text"].strip()
-                    if text:
-                        with _team_lock:
-                            _team_channel.append({"from": f"{emoji} {role}", "text": text[:300], "time": time.time()})
-                        console.print(f"  [{color}]{emoji} {role}[/{color}]: {text[:200]}")
+        self.status = "done"
+        self.last_seen = time.time()
+        console.print(f"  [{self.color}]{self.emoji} {self.name}({self.role}) finished[/{self.color}]")
 
-            # Process tools
-            tool_blocks = [b for b in content if b.get("type") == "tool_use"]
-            if not tool_blocks:
+    def _parse_assignments(self, messages_list):
+        """Extract JSON assignments addressed to this role."""
+        assignments = []
+        for m in messages_list:
+            text = m.get("text", "")
+            for line in text.split("\n"):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        obj = json.loads(line)
+                        if obj.get("type") == "assignment" and obj.get("to") == self.role:
+                            assignments.append(obj)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        return assignments
+
+
+# ---------------------------------------------------------------------------
+# TeamManager — orchestrator for all agents
+# ---------------------------------------------------------------------------
+class TeamManager:
+    """Manages team agents, message routing, task board, and monitoring."""
+
+    MAX_AGENTS = 8
+
+    def __init__(self):
+        self.agents: Dict[str, TeamAgent] = {}
+        self.channel_history = []
+        self.channel_lock = threading.Lock()
+        self.running = False
+        self.task_board = {}
+        self.task_board_lock = threading.Lock()
+        self._task_counter = 0
+        self._monitor_thread = None
+
+    # ---- Message routing ----
+
+    def post_message(self, from_label: str, text: str, to: str = None):
+        """Post a message to the channel with optional routing."""
+        msg = {"from": from_label, "text": text[:300], "time": time.time(), "to": to}
+        with self.channel_lock:
+            self.channel_history.append(msg)
+
+    def route_message(self, from_role: str, text: str):
+        """Route a message based on @mentions."""
+        agent = self.agents.get(from_role)
+        from_label = f"{agent.emoji} {agent.name}({from_role})" if agent else from_role
+
+        # Detect @mentions
+        if "@all" in text or "@team" in text:
+            self.post_message(from_label, text, to="@all")
+        else:
+            # Check for specific @role mentions
+            mentioned = []
+            for role_name in self.agents:
+                if f"@{role_name}" in text:
+                    mentioned.append(role_name)
+            if mentioned:
+                for target in mentioned:
+                    self.post_message(from_label, text, to=target)
+            else:
+                # No specific mention → shared channel (visible to all)
+                self.post_message(from_label, text, to=None)
+
+    def get_messages(self, for_role: str = None, n: int = 10):
+        """Get recent messages relevant to a specific role."""
+        with self.channel_lock:
+            if for_role is None:
+                return list(self.channel_history[-n:])
+            # Filter: messages addressed to this role, @all, or shared (to=None)
+            relevant = [m for m in self.channel_history
+                        if m.get("to") is None or m.get("to") == "@all" or m.get("to") == for_role]
+            return list(relevant[-n:])
+
+    # ---- Task board ----
+
+    def task_board_create(self, text: str, assignee: str = None, priority: int = 3, created_by: str = None) -> str:
+        with self.task_board_lock:
+            self._task_counter += 1
+            tid = f"task-{self._task_counter}"
+            self.task_board[tid] = {
+                "text": text, "status": "pending", "assignee": assignee or "unassigned",
+                "priority": priority, "created_by": created_by or "unknown",
+                "created_at": time.time(),
+            }
+        return f"Created {tid}: {text[:60]} (assigned to {assignee or 'unassigned'})"
+
+    def task_board_update(self, task_id: str, status: str) -> str:
+        with self.task_board_lock:
+            if task_id not in self.task_board:
+                return f"Task {task_id} not found. Use team_task_list to see all tasks."
+            if status not in ("pending", "in_progress", "done"):
+                return f"Invalid status: {status}. Use: pending, in_progress, done"
+            self.task_board[task_id]["status"] = status
+        return f"Updated {task_id} -> {status}"
+
+    def task_board_list(self) -> str:
+        with self.task_board_lock:
+            if not self.task_board:
+                return "Task board is empty."
+            lines = []
+            status_icons = {"pending": "⬜", "in_progress": "🔄", "done": "✅"}
+            for tid, t in sorted(self.task_board.items(), key=lambda x: x[1].get("priority", 3)):
+                icon = status_icons.get(t["status"], "❓")
+                lines.append(f"{icon} {tid} [{t['status']}] P{t['priority']} → {t['assignee']}: {t['text'][:60]}")
+            done = sum(1 for t in self.task_board.values() if t["status"] == "done")
+            total = len(self.task_board)
+            lines.append(f"\nProgress: {done}/{total} done")
+            return "\n".join(lines)
+
+    # ---- Dynamic agent spawning (Level 3.1) ----
+
+    def spawn_agent(self, role: str, custom_prompt: str = None) -> str:
+        if len(self.agents) >= self.MAX_AGENTS:
+            return f"Cannot spawn: max {self.MAX_AGENTS} agents reached."
+        if role in self.agents:
+            return f"Agent '{role}' already exists."
+
+        agent = TeamAgent(role, self._current_task, self, custom_system=custom_prompt)
+        self.agents[role] = agent
+        t = threading.Thread(target=agent.run, daemon=True)
+        agent.thread = t
+        t.start()
+        console.print(f"  [bold bright_cyan]🆕 Spawned: {agent.emoji} {agent.name}({role})[/bold bright_cyan]")
+        self.post_message("🧠 system", f"New agent joined: {agent.emoji} {role}", to="@all")
+        return f"Spawned new agent: {role} ({agent.emoji})"
+
+    # ---- Heartbeat monitor (Level 2.5) ----
+
+    def _heartbeat_monitor(self):
+        """Background thread that monitors agent health."""
+        while self.running:
+            time.sleep(10)
+            if not self.running:
                 break
+            for role, agent in list(self.agents.items()):
+                if agent.status in ("done", "error"):
+                    continue
+                elapsed = time.time() - agent.last_seen
+                if elapsed > 120:
+                    console.print(f"  [bold red]⚠ {agent.emoji} {agent.name} unresponsive ({int(elapsed)}s)[/bold red]")
+                    agent.status = "error"
+                    agent.current_task = f"timeout ({int(elapsed)}s)"
+                elif elapsed > 60:
+                    console.print(f"  [yellow]⚠ {agent.emoji} {agent.name} slow ({int(elapsed)}s)[/yellow]")
 
-            messages.append({"role": "assistant", "content": content})
+    # ---- Start / Stop ----
 
-            tool_results = []
-            for tb in tool_blocks:
-                name = tb["name"]
-                inp = tb.get("input", {})
-                tid = tb["id"]
-                handler = TOOL_HANDLERS.get(name)
-                if handler and name not in ("spawn_agent", "browser"):
-                    console.print(f"  [dim]{emoji} {role} → {name}[/dim]")
-                    result = handler(inp)
-                else:
-                    result = f"[not available for team agents: {name}]"
-                tool_results.append({"type": "tool_result", "tool_use_id": tid, "content": result[:5000]})
+    def start(self, task: str, roles: list, isolation: str = "thread", max_rounds: int = 25):
+        """Start the team. isolation='thread' or 'process'."""
+        import multiprocessing as mp
 
-            messages.append({"role": "user", "content": tool_results})
-            time.sleep(1)  # small delay between iterations
+        self.running = True
+        self._current_task = task
+        self._isolation = isolation
+        self._max_rounds = max_rounds
+        with self.channel_lock:
+            self.channel_history.clear()
+        with self.task_board_lock:
+            self.task_board.clear()
+            self._task_counter = 0
+        self.agents.clear()
 
+        # Create agents
+        for role in roles:
+            agent = TeamAgent(role, task, self)
+            agent.max_iterations = max_rounds
+            self.agents[role] = agent
+
+        console.print(f"\n[bold cyan]Starting team ({len(roles)} agents) [isolation={isolation}]:[/bold cyan]")
+        for role, agent in self.agents.items():
+            console.print(f"  {agent.emoji} {agent.name}({role})")
+        console.print()
+
+        # Start agents — planner/supervisor first
+        first_roles = [r for r in roles if r in ("planner", "supervisor")]
+        other_roles = [r for r in roles if r not in ("planner", "supervisor")]
+
+        processes = []
+
+        def _start_agent(role):
+            agent = self.agents[role]
+            if isolation == "process":
+                # Process-based: each agent runs in its own process
+                # Note: agent.run uses httpx + console, so we wrap in a subprocess
+                p = mp.Process(target=self._run_agent_in_process, args=(role, task), daemon=True)
+                p.start()
+                processes.append((role, p))
+                agent.thread = None  # track via process instead
+            else:
+                t = threading.Thread(target=agent.run, daemon=True)
+                agent.thread = t
+                t.start()
+
+        for role in first_roles:
+            _start_agent(role)
+        if first_roles:
+            time.sleep(3)  # let planner/supervisor create the plan
+        for role in other_roles:
+            _start_agent(role)
+            time.sleep(1)
+
+        # Start heartbeat monitor
+        self._monitor_thread = threading.Thread(target=self._heartbeat_monitor, daemon=True)
+        self._monitor_thread.start()
+
+        # Wait for all to finish
+        if isolation == "process":
+            for role, p in processes:
+                p.join(timeout=300)
+                if p.is_alive():
+                    console.print(f"  [red]⚠ {role} timed out — terminating[/red]")
+                    p.terminate()
+        else:
+            for role, agent in self.agents.items():
+                if agent.thread:
+                    agent.thread.join(timeout=300)
+
+        self.running = False
+        with self.channel_lock:
+            msg_count = len(self.channel_history)
+            summary = "\n".join(f"[{m['from']}] {m['text']}" for m in self.channel_history)
+        console.print(f"\n[bold green]Team finished! {msg_count} messages exchanged.[/bold green]")
+
+        # Show final task board
+        board = self.task_board_list()
+        if "task-" in board:
+            console.print(f"\n[bold]Final Task Board:[/bold]")
+            console.print(board)
+
+        # Show files created/modified by agents
+        all_files_written = []
+        for role, agent in self.agents.items():
+            if agent.memory["files_written"]:
+                for f in agent.memory["files_written"]:
+                    if f not in all_files_written:
+                        all_files_written.append(f)
+        if all_files_written:
+            console.print(f"\n[bold]Files created/modified:[/bold]")
+            for f in all_files_written:
+                console.print(f"  [green]+[/green] {f}")
+
+        # Build rich summary for main conversation
+        files_summary = ""
+        if all_files_written:
+            files_summary = "\n\nFiles created/modified:\n" + "\n".join(f"  - {f}" for f in all_files_written)
+            # Include content of written files in summary
+            for fpath in all_files_written[:5]:  # limit to 5 files
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read(3000)
+                        files_summary += f"\n\n--- {fpath} ---\n{content}"
+                except Exception:
+                    pass
+
+        return summary + files_summary
+
+    def _run_agent_in_process(self, role: str, task: str):
+        """Wrapper to run an agent in a separate process."""
+        # In process mode, we create a fresh agent (can't share TeamManager across processes easily)
+        # So process mode uses a simplified loop with channel communication via the shared manager
+        try:
+            agent = self.agents.get(role)
+            if agent:
+                agent.run()
         except Exception as e:
-            console.print(f"  [red]{emoji} {role} error: {e}[/red]")
-            break
+            console.print(f"  [red]{role} process error: {e}[/red]")
 
-    console.print(f"  [{color}]{emoji} {role} finished[/{color}]")
+    def stop(self):
+        self.running = False
+
+    def get_agent_statuses(self) -> dict:
+        return {role: agent.get_status_dict() for role, agent in self.agents.items()}
+
+    # ---- Visualization (Level 3.5) ----
+
+    def render_status_table(self):
+        """Render a Rich table showing all agent statuses."""
+        tbl = Table(title="Team Agent Status", show_lines=True)
+        tbl.add_column("Agent", style="bold")
+        tbl.add_column("Status")
+        tbl.add_column("Iter", justify="center")
+        tbl.add_column("Current Task")
+        tbl.add_column("Files", justify="center")
+        tbl.add_column("Last Seen")
+        status_colors = {"idle": "dim", "working": "yellow", "done": "green", "error": "red"}
+        for role, agent in self.agents.items():
+            st_color = status_colors.get(agent.status, "white")
+            elapsed = time.time() - agent.last_seen
+            ago = f"{int(elapsed)}s ago" if elapsed > 1 else "just now"
+            files = len(agent.memory["files_read"]) + len(agent.memory["files_written"])
+            tbl.add_row(
+                f"{agent.emoji} {agent.name}({role})",
+                f"[{st_color}]{agent.status}[/{st_color}]",
+                str(agent.iteration),
+                agent.current_task[:50],
+                str(files),
+                ago,
+            )
+        return tbl
+
+    def render_task_graph(self) -> str:
+        """Generate a Mermaid diagram of the task board."""
+        if not self.task_board:
+            return "No tasks on the board."
+        lines = ["```mermaid", "graph TD"]
+        status_style = {"pending": ":::pending", "in_progress": ":::active", "done": ":::done"}
+        for tid, t in self.task_board.items():
+            safe_text = t['text'][:40].replace('"', "'")
+            node_id = tid.replace("-", "_")
+            style = status_style.get(t["status"], "")
+            lines.append(f'    {node_id}["{tid}: {safe_text}"]{style}')
+            if t.get("assignee") and t["assignee"] != "unassigned":
+                assignee_id = f"agent_{t['assignee']}"
+                lines.append(f'    {assignee_id}(("{t["assignee"]}")) --> {node_id}')
+        lines.append("    classDef pending fill:#f9f,stroke:#333")
+        lines.append("    classDef active fill:#ff9,stroke:#333")
+        lines.append("    classDef done fill:#9f9,stroke:#333")
+        lines.append("```")
+        return "\n".join(lines)
 
 
-def run_team(task: str, roles: list = None):
+# Global TeamManager instance
+_team_manager = TeamManager()
+
+# Backward-compatible globals (used by /team command and _cleanup_all)
+_team_running = False
+_team_agent_status = {}
+
+
+def _detect_team_roles(task: str) -> list:
+    """Auto-detect the best team composition based on the task description."""
+    task_lower = task.lower()
+    # Coding keywords (strong signals)
+    code_kw = ["code", "build", "create app", "website", "web app", "api", "rest api",
+               "frontend", "backend", "html", "css", "react", "vue", "angular",
+               "python", "javascript", "typescript", "deploy", "fix bug", "debug",
+               "refactor", "implement", "develop", "server", "database", "component",
+               "function", "class", "module", "endpoint", "cli", "script"]
+    # Research keywords
+    research_kw = ["research", "find out", "compare", "investigate", "search for",
+                   "analyze", "study", "explore", "survey", "benchmark", "evaluate",
+                   "pros and cons", "what is", "how does"]
+    # Writing keywords (content creation, not code-related "write")
+    write_kw = ["write a", "write about", "write an", "article", "blog", "blog post",
+                "document", "report", "summary", "summarize", "content", "essay",
+                "proposal", "strategy", "readme", "translate", "draft", "copywrite",
+                "narrative", "presentation", "slide"]
+
+    # Count keyword matches to determine strength of signal
+    code_hits = [kw for kw in code_kw if kw in task_lower]
+    research_hits = [kw for kw in research_kw if kw in task_lower]
+    write_hits = [kw for kw in write_kw if kw in task_lower]
+
+    is_code = len(code_hits) > 0
+    is_research = len(research_hits) > 0
+    is_writing = len(write_hits) > 0
+
+    # Writing/research take priority when explicitly stated (e.g. "write a blog post about Python")
+    if is_writing and is_research:
+        return ["planner", "researcher", "analyst", "writer"]
+    elif is_writing and is_code:
+        # "write about" + code topic → writing team; "build + docs" → code team
+        if len(write_hits) >= len(code_hits):
+            return ["planner", "writer", "editor"]
+        return ["planner", "frontend", "backend"]
+    elif is_writing:
+        return ["planner", "writer", "editor"]
+    elif is_research:
+        if is_code:
+            return ["planner", "researcher", "frontend", "backend"]
+        return ["planner", "researcher", "analyst"]
+    elif is_code:
+        return ["planner", "frontend", "backend"]
+    else:
+        return ["planner", "researcher", "writer"]
+
+
+def run_team(task: str, roles: list = None, isolation: str = "thread", max_rounds: int = 25):
     """Start a team of agents working together."""
-    global _team_running, _team_threads, _team_channel
+    global _team_running, _team_agent_status
 
     if not roles:
-        roles = ["planner", "frontend", "backend"]
+        roles = _detect_team_roles(task)
+        role_str = ", ".join(roles)
+        console.print(f"[dim]Auto-detected team: {role_str}[/dim]")
 
-    # Validate roles
+    # Validate roles — allow custom roles too, just warn
+    known_roles = set(_TEAM_ROLES.keys())
     for r in roles:
-        if r not in _TEAM_ROLES:
-            console.print(f"[error]Unknown role: {r}. Available: {', '.join(_TEAM_ROLES.keys())}[/error]")
-            return
+        if r not in known_roles:
+            console.print(f"[warning]Note: '{r}' is a custom role (no predefined prompt)[/warning]")
 
     _team_running = True
-    _team_channel.clear()
-    _team_threads.clear()
-
-    console.print(f"\n[bold cyan]Starting team ({len(roles)} agents):[/bold cyan]")
-    for r in roles:
-        cfg = _TEAM_ROLES[r]
-        console.print(f"  {cfg['emoji']} {r}")
-    console.print()
-
-    # Start planner first, others after a delay
-    for i, role in enumerate(roles):
-        agent_id = f"team-{role}-{os.getpid()}"
-        t = threading.Thread(target=_team_agent_loop, args=(role, task, agent_id), daemon=True)
-        _team_threads.append(t)
-
-    # Stagger starts: planner first, then others
-    if not _team_threads:
-        console.print("[red]No team agents to start[/red]")
-        return ""
-    _team_threads[0].start()
-    time.sleep(3)  # let planner create the plan
-    for t in _team_threads[1:]:
-        t.start()
-        time.sleep(1)
-
-    # Wait for all to finish
-    for t in _team_threads:
-        t.join(timeout=300)  # 5 min max per agent
-
+    result = _team_manager.start(task, roles, isolation=isolation, max_rounds=max_rounds)
     _team_running = False
-    console.print(f"\n[bold green]Team finished! {len(_team_channel)} messages exchanged.[/bold green]")
+    _team_agent_status = _team_manager.get_agent_statuses()
 
-    # Return summary
-    summary = "\n".join(f"[{m['from']}] {m['text']}" for m in _team_channel)
-    return summary
+    return result
 
 
 TOOL_HANDLERS = {
@@ -2625,6 +4065,7 @@ TOOL_HANDLERS = {
     "browser": exec_browser,
     "http": exec_http,
     "screenshot": exec_screenshot,
+    "semantic_search": exec_semantic_search,
     "bosshelp": lambda args: _boss_help(
         problem=args.get("problem", ""),
         context=args.get("context", ""),
@@ -2635,11 +4076,43 @@ TOOL_HANDLERS = {
 
 
 # ============================================================================
-# Streaming Response Renderer
+# Streaming Response Renderer (Professional Neon Dark + Realtime)
 # ============================================================================
 
+
+def make_professional_header():
+    """Header v2 (compact + clean)."""
+    ctx_max = CONTEXT_WINDOWS.get(MODEL, 200000)
+    ctx_pct = (last_input_tokens / ctx_max * 100) if last_input_tokens > 0 else 0
+    task_count = len([t for t in _tasks if t["status"] != "done"])
+
+    # Shorten path for clean display
+    short_cwd = CWD
+    if len(short_cwd) > 35:
+        short_cwd = "..." + short_cwd[-32:]
+
+    header = Columns([
+        Text(" ToonCode ", style="bold primary on #0f0f23"),
+        Text(f" {MODEL} ", style="bold accent"),
+        Text(f" {short_cwd} ", style="dim white"),
+        Text(f" msgs:{message_count} ", style="dim"),
+        Text(f" ctx:{last_input_tokens//1000}k ",
+             style="bold warning" if ctx_pct > 75 else "dim"),
+        Text(f" tasks:{task_count} ", style="dim"),
+        Text(f" {datetime.now().strftime('%H:%M')} ", style="dim"),
+    ], expand=True)
+
+    return Panel(
+        header,
+        style="on #16213e",
+        padding=(0, 1),
+        title="[bold primary]ToonCode[/bold primary]",
+        title_align="left",
+    )
+
+
 class StreamRenderer:
-    """Handles rendering of streaming AI responses using Rich."""
+    """Professional Neon Dark StreamRenderer with realtime smooth updates."""
 
     def __init__(self):
         self.text_buffer = ""
@@ -2657,45 +4130,41 @@ class StreamRenderer:
         self._live = None
         self._finalized = False
         self._start_time = time.time()
-        self._token_count = 0  # approximate output tokens
+        self._token_count = 0
 
     def start(self):
         """Start the live display."""
         self._live = Live(
             self._build_display(),
             console=console,
-            refresh_per_second=20,
+            refresh_per_second=30,          # smoother realtime updates
             vertical_overflow="visible",
+            transient=True,
         )
         self._live.start()
 
     def stop(self):
         """Stop the live display and print final formatted output."""
         if self._live:
-            # Clear live display by setting empty content, then stop
             self._live.update(Text(""))
             self._live.stop()
             self._live = None
-            # Now print the final output with proper Markdown rendering
             self._print_final()
 
     def _build_display(self) -> Group:
-        """Build the current display state."""
+        """Build display — no header, just content."""
         renderables = []
 
-        # Thinking section
+        # Thinking panel
         if self.thinking_buffer:
-            thinking_text = Text(self.thinking_buffer, style="thinking")
-            thinking_panel = Panel(
-                thinking_text,
+            renderables.append(Panel(
+                Text(self.thinking_buffer, style="dim italic"),
                 title="[dim]thinking...[/dim]",
-                title_align="left",
-                border_style="dim",
-                padding=(0, 1),
-            )
-            renderables.append(thinking_panel)
+                border_style="accent",
+                padding=(0, 2),
+            ))
 
-        # Completed tool results
+        # Tool cards
         for tool in self.tool_blocks:
             renderables.append(self._make_tool_panel(tool))
 
@@ -2703,45 +4172,26 @@ class StreamRenderer:
         if self.in_tool and self.current_tool_name:
             renderables.append(Panel(
                 Text(f"calling {self.current_tool_name}...", style="dim italic"),
-                border_style="yellow",
+                border_style="accent",
                 padding=(0, 1),
             ))
 
-        # Text response - use plain Text during streaming for speed
+        # Main response
         if self.text_buffer:
-            renderables.append(Text(self.text_buffer))
-
-        if not renderables:
-            renderables.append(Text("...", style="dim"))
-
-        # Status line
-        elapsed = time.time() - self._start_time
-        status_parts = Text()
-        status_parts.append("* ", style="bold cyan")
-        if self.in_thinking:
-            status_parts.append("Thinking", style="bold cyan")
-        elif self.in_tool:
-            status_parts.append(f"Running {self.current_tool_name}", style="bold yellow")
-        else:
-            status_parts.append("Generating", style="bold green")
-        status_parts.append(f"... ({elapsed:.0f}s", style="dim")
-        if self._token_count > 0:
-            if self._token_count >= 1000:
-                status_parts.append(f" | {self._token_count/1000:.1f}k tokens", style="dim")
-            else:
-                status_parts.append(f" | {self._token_count} tokens", style="dim")
-        status_parts.append(") ", style="dim")
-        status_parts.append("Ctrl+C to stop", style="dim italic")
-        renderables.append(status_parts)
+            renderables.append(Panel(
+                Text(self.text_buffer),
+                border_style="primary",
+                padding=(1, 2),
+                title="[bold primary]Response[/bold primary]",
+            ))
 
         return Group(*renderables)
 
     def _make_tool_panel(self, tool: dict) -> Panel:
-        """Create a styled panel for a tool call."""
+        """Create a neon-styled panel for a tool call."""
         name = tool.get("name", "unknown")
         inp = tool.get("input", {})
 
-        # Build a concise summary of what the tool is doing
         if name == "bash":
             cmd = inp.get("command", "")
             desc = inp.get("description", "")
@@ -2757,8 +4207,7 @@ class StreamRenderer:
             lines = content.count("\n") + 1
             summary = f"{fp} ({lines} lines)"
         elif name == "edit":
-            fp = inp.get("filePath", "")
-            summary = fp
+            summary = inp.get("filePath", "")
         elif name == "glob":
             summary = inp.get("pattern", "")
         elif name == "grep":
@@ -2776,27 +4225,27 @@ class StreamRenderer:
         if name != "bash":
             title_extra = ""
 
-        title = f"[bold yellow]{name}[/bold yellow]{title_extra if name == 'bash' else ''}"
-        content_text = Text(summary, style="dim white")
+        title = f"[bold #ff00aa]{name}[/bold #ff00aa]{title_extra if name == 'bash' else ''}"
+        content_text = Text(summary, style="#8888aa")
 
         return Panel(
             content_text,
             title=title,
             title_align="left",
-            border_style="yellow",
+            border_style="#ff00aa",
             padding=(0, 1),
         )
 
     def _print_final(self):
-        """Print the final formatted output after streaming stops."""
+        """Print the final formatted output after streaming stops (no duplicate header)."""
         # Print thinking if any
         if self.thinking_buffer:
-            thinking_text = Text(self.thinking_buffer, style="thinking")
+            thinking_text = Text(self.thinking_buffer, style="dim italic")
             console.print(Panel(
                 thinking_text,
                 title="[dim]thinking[/dim]",
                 title_align="left",
-                border_style="dim",
+                border_style="accent",
                 padding=(0, 1),
             ))
 
@@ -2819,9 +4268,7 @@ class StreamRenderer:
 
         while i < len(lines):
             line = lines[i].strip()
-            # Detect markdown table: line starts with | and has multiple |
             if line.startswith("|") and line.count("|") >= 3:
-                # Flush any accumulated non-table text
                 if non_table_lines:
                     try:
                         console.print(Markdown("\n".join(non_table_lines)))
@@ -2829,19 +4276,16 @@ class StreamRenderer:
                         console.print("\n".join(non_table_lines))
                     non_table_lines = []
 
-                # Collect all table lines
                 table_lines = []
                 while i < len(lines) and lines[i].strip().startswith("|"):
                     table_lines.append(lines[i].strip())
                     i += 1
 
-                # Parse table
                 self._render_rich_table(table_lines)
             else:
                 non_table_lines.append(lines[i])
                 i += 1
 
-        # Flush remaining non-table text
         if non_table_lines:
             content = "\n".join(non_table_lines).strip()
             if content:
@@ -2851,7 +4295,7 @@ class StreamRenderer:
                     console.print(content)
 
     def _render_rich_table(self, table_lines: list):
-        """Convert markdown table lines to a Rich Table."""
+        """Convert markdown table lines to a Rich Table with neon styling."""
         if len(table_lines) < 2:
             console.print("\n".join(table_lines))
             return
@@ -2860,21 +4304,18 @@ class StreamRenderer:
             cells = line.strip().strip("|").split("|")
             return [c.strip().replace("**", "").replace("*", "") for c in cells]
 
-        # First row = headers
         headers = _parse_row(table_lines[0])
 
-        # Skip separator row (---|---|---)
         start = 1
         if start < len(table_lines) and re.match(r'^[\|\s\-:]+$', table_lines[start]):
             start = 2
 
-        table = Table(border_style="cyan", show_header=True, header_style="bold cyan", padding=(0, 1))
+        table = Table(border_style="#00f5ff", show_header=True, header_style="bold #00f5ff", padding=(0, 1))
         for h in headers:
             table.add_column(h)
 
         for row_line in table_lines[start:]:
             cells = _parse_row(row_line)
-            # Pad cells to match header count
             while len(cells) < len(headers):
                 cells.append("")
             table.add_row(*cells[:len(headers)])
@@ -2882,12 +4323,11 @@ class StreamRenderer:
         console.print(table)
 
     def _print_tool_result(self, tool: dict):
-        """Print a tool result panel."""
+        """Print a tool result panel with neon styling."""
         name = tool.get("name", "unknown")
         inp = tool.get("input", {})
         result = tool.get("result", "")
 
-        # Build content
         parts = []
         if name == "bash":
             cmd = inp.get("command", "")
@@ -2907,25 +4347,24 @@ class StreamRenderer:
         elif name == "web_fetch":
             parts.append(Text(inp.get("url", ""), style="bold"))
 
-        # Result preview
         if result:
             preview = result[:500]
             if len(result) > 500:
                 preview += f"\n... ({len(result)} chars total)"
             parts.append(Text(""))
-            parts.append(Text(preview, style="dim"))
+            parts.append(Text(preview, style="#8888aa"))
 
         content = Group(*parts) if parts else Text("(done)")
         desc = inp.get("description", "") if name == "bash" else ""
-        title = f"[bold yellow]{name}[/bold yellow]"
+        title = f"[bold #ff00aa]{name}[/bold #ff00aa]"
         if desc:
-            title += f" [dim]- {desc}[/dim]"
+            title += f" [#8888aa]- {desc}[/#8888aa]"
 
         console.print(Panel(
             content,
             title=title,
             title_align="left",
-            border_style="yellow",
+            border_style="#ff00aa",
             padding=(0, 1),
         ))
 
@@ -2938,7 +4377,7 @@ class StreamRenderer:
 
     def on_thinking_delta(self, text: str):
         self.thinking_buffer += text
-        self._token_count += max(1, len(text) // 4)  # rough estimate
+        self._token_count += max(1, len(text) // 4)
         self.update()
 
     def on_text_delta(self, text: str):
@@ -2990,6 +4429,11 @@ class StreamRenderer:
 # ============================================================================
 
 def make_request_headers() -> dict:
+    if _is_puter():
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {_get_puter_token()}",
+        }
     msg_id = _gen_id("msg", 24)
     h = {
         **HEADERS,
@@ -3006,6 +4450,8 @@ def make_request_headers() -> dict:
 
 def _get_current_api_url() -> str:
     """Get API URL for current request."""
+    if _is_puter():
+        return "https://api.puter.com/puterai/openai/v1/chat/completions"
     return _get_api_url()
 
 
@@ -3062,6 +4508,142 @@ def _validate_messages(messages: list):
     messages.extend(fixed)
 
 
+def _puter_request(messages: list, system_prompt: str, tools: list, renderer) -> dict:
+    """Handle API request via Puter (OpenAI-compatible format with streaming)."""
+    global total_input_tokens, total_output_tokens, last_input_tokens
+
+    # Convert to OpenAI format
+    oai_messages = [{"role": "system", "content": system_prompt}] + _convert_to_openai_messages(messages)
+    oai_tools = _convert_openai_tools(tools)
+
+    body = {
+        "model": MODEL,
+        "max_tokens": 32000,
+        "messages": oai_messages,
+        "tools": oai_tools if oai_tools else None,
+        "tool_choice": "auto" if oai_tools else None,
+        "stream": True,
+    }
+    # Remove None values
+    body = {k: v for k, v in body.items() if v is not None}
+
+    if MODEL not in NO_SAMPLING_PARAMS:
+        body["temperature"] = 0.7
+        body["top_p"] = 0.95
+
+    headers = make_request_headers()
+
+    # Streaming with OpenAI SSE format
+    content_text = ""
+    tool_calls_map = {}  # index -> {id, name, arguments}
+    stop_reason = "end_turn"
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(300.0, connect=15.0, read=300.0)) as client:
+            with client.stream("POST", _get_current_api_url(), headers=headers, json=body) as resp:
+                if resp.status_code != 200:
+                    err = resp.read().decode(errors="replace")
+                    console.print(f"[error]Puter API Error ({resp.status_code}): {err[:500]}[/error]")
+                    return {"content": [{"type": "text", "text": f"API Error {resp.status_code}: {err[:200]}"}], "stop_reason": "error"}
+
+                renderer.on_text_start()
+                line_buf = b""
+                for chunk in resp.iter_bytes():
+                    line_buf += chunk
+                    while b"\n" in line_buf:
+                        raw_line, line_buf = line_buf.split(b"\n", 1)
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                        elif line.startswith("{"):
+                            data_str = line
+                        else:
+                            continue
+                        if data_str.strip() in ("[DONE]", ""):
+                            continue
+                        try:
+                            event = json.loads(data_str)
+                        except (json.JSONDecodeError, Exception):
+                            continue
+
+                        # OpenAI streaming format
+                        choices = event.get("choices", [])
+                        if not choices:
+                            # Usage info
+                            usage = event.get("usage", {})
+                            if usage:
+                                total_input_tokens += usage.get("prompt_tokens", 0)
+                                total_output_tokens += usage.get("completion_tokens", 0)
+                                last_input_tokens = usage.get("prompt_tokens", 0)
+                            continue
+
+                        delta = choices[0].get("delta", {})
+                        finish = choices[0].get("finish_reason")
+
+                        # Text content
+                        if delta.get("content"):
+                            content_text += delta["content"]
+                            renderer.on_text_delta(delta["content"])
+
+                        # Tool calls
+                        for tc in delta.get("tool_calls", []):
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_map:
+                                tool_calls_map[idx] = {
+                                    "id": tc.get("id", _gen_id("toolu", 24)),
+                                    "name": tc.get("function", {}).get("name", ""),
+                                    "arguments": "",
+                                }
+                            if tc.get("function", {}).get("name"):
+                                tool_calls_map[idx]["name"] = tc["function"]["name"]
+                            if tc.get("function", {}).get("arguments"):
+                                tool_calls_map[idx]["arguments"] += tc["function"]["arguments"]
+
+                        if finish:
+                            if finish == "tool_calls":
+                                stop_reason = "tool_use"
+                            elif finish == "length":
+                                stop_reason = "max_tokens"
+                            else:
+                                stop_reason = "end_turn"
+
+                renderer.on_text_stop()
+
+    except httpx.ConnectError as e:
+        console.print(f"[error]Puter connection error: {e}[/error]")
+        return {"content": [{"type": "text", "text": f"Connection error: {e}"}], "stop_reason": "error"}
+    except httpx.ReadTimeout:
+        console.print("[error]Puter request timed out[/error]")
+        return {"content": [{"type": "text", "text": "Request timed out"}], "stop_reason": "error"}
+    except Exception as e:
+        console.print(f"[error]Puter error: {e}[/error]")
+        return {"content": [{"type": "text", "text": f"Error: {e}"}], "stop_reason": "error"}
+
+    # Build Anthropic-format result
+    result_content = []
+    if content_text:
+        result_content.append({"type": "text", "text": content_text})
+    for idx in sorted(tool_calls_map.keys()):
+        tc = tool_calls_map[idx]
+        try:
+            args = json.loads(tc["arguments"])
+        except (json.JSONDecodeError, Exception):
+            args = {}
+        result_content.append({
+            "type": "tool_use",
+            "id": tc["id"],
+            "name": tc["name"],
+            "input": args,
+        })
+
+    if not result_content:
+        result_content.append({"type": "text", "text": "(empty response)"})
+
+    return {"content": result_content, "stop_reason": stop_reason}
+
+
 def stream_response(messages: list, renderer: StreamRenderer) -> dict:
     """Send request and stream the response, returning parsed content blocks."""
     global total_input_tokens, total_output_tokens, last_input_tokens
@@ -3070,6 +4652,11 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
     _validate_messages(messages)
 
     system_prompt = build_system_prompt()
+
+    # === Puter API path (OpenAI-compatible, non-streaming for reliability) ===
+    if _is_puter():
+        return _puter_request(messages, system_prompt, TOOLS, renderer)
+
     body = {
         "model": MODEL,
         "max_tokens": 32000,
@@ -3437,7 +5024,7 @@ def _find_claude_cmd() -> Optional[str]:
 
 
 def _boss_help(problem: str, context: str = "", code: str = "", error: str = "") -> str:
-    """Ask Claude Code (boss) for help when stuck. Falls back to own model if CLI not found."""
+    """Ask Boss AI (boss) for help when stuck. Falls back to own model if CLI not found."""
 
     # Build help prompt
     help_prompt = f"""I'm an AI coding agent and I'm STUCK. I need your help to solve this problem.
@@ -3460,10 +5047,10 @@ def _boss_help(problem: str, context: str = "", code: str = "", error: str = "")
 3. Step by step if needed
 Be specific. Give copy-paste ready solutions."""
 
-    # Try Claude Code CLI first
+    # Try Boss AI CLI first
     claude_cmd = _find_claude_cmd()
     if claude_cmd:
-        console.print("[bold magenta][bosshelp] Asking Claude Code...[/bold magenta]")
+        console.print("[bold magenta][bosshelp] Asking Boss AI...[/bold magenta]")
         try:
             result = subprocess.run(
                 [claude_cmd, "--print", "--dangerously-skip-permissions"],
@@ -3475,14 +5062,14 @@ Be specific. Give copy-paste ready solutions."""
             if answer:
                 console.print(Panel(
                     Text(answer[:500] + ("..." if len(answer) > 500 else ""), style="dim"),
-                    title="[bold magenta]Boss Answer (Claude Code)[/bold magenta]",
+                    title="[bold magenta]Boss Answer (Boss AI)[/bold magenta]",
                     border_style="magenta",
                 ))
                 return answer
         except subprocess.TimeoutExpired:
-            console.print("[yellow]Claude Code timed out, falling back to own model...[/yellow]")
+            console.print("[yellow]Boss AI timed out, falling back to own model...[/yellow]")
         except Exception as e:
-            console.print(f"[yellow]Claude Code error ({e}), falling back to own model...[/yellow]")
+            console.print(f"[yellow]Boss AI error ({e}), falling back to own model...[/yellow]")
 
     # Fallback: use our own model via API
     console.print(f"[bold magenta][bosshelp] Asking {MODEL} for help...[/bold magenta]")
@@ -4014,30 +5601,88 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
 
     elif command == "/team":
         if not arg:
-            console.print("[info]Usage: /team <task> [--roles planner,frontend,backend,reviewer,tester][/info]")
-            console.print(f"[info]Available roles: {', '.join(_TEAM_ROLES.keys())}[/info]")
-            console.print("[info]Default: planner + frontend + backend[/info]")
-            console.print("[info]/team stop — stop running team[/info]")
+            console.print("[info]Usage: /team <task> [--roles role1,role2,...] [--rounds 25] [--isolation thread|process][/info]")
+            console.print(f"[info]Available roles: {', '.join(_TEAM_ROLES.keys())} (+ custom)[/info]")
+            console.print("[info]Auto-detect: roles are picked based on task (code/research/writing)[/info]")
+            console.print("[info]  Code task    -> planner, frontend, backend[/info]")
+            console.print("[info]  Research     -> planner, researcher, analyst[/info]")
+            console.print("[info]  Writing      -> planner, writer, editor[/info]")
+            console.print("[info]  General      -> planner, researcher, writer[/info]")
+            console.print("[info]/team status — show agent statuses + task board[/info]")
+            console.print("[info]/team graph  — show task dependency graph (Mermaid)[/info]")
+            console.print("[info]/team stop   — stop running team[/info]")
             return True
 
         if arg == "stop":
             global _team_running
+            _team_manager.stop()
             _team_running = False
             console.print("[info]Stopping team...[/info]")
             return True
 
-        # Parse roles from --roles flag
+        if arg == "status":
+            if not _team_manager.agents:
+                console.print("[info]No team is running. Use /team <task> to start one.[/info]")
+                return True
+            console.print(_team_manager.render_status_table())
+            with _team_manager.channel_lock:
+                console.print(f"[dim]Channel: {len(_team_manager.channel_history)} messages[/dim]")
+            board = _team_manager.task_board_list()
+            if "task-" in board:
+                console.print(f"\n[bold]Task Board:[/bold]")
+                console.print(board)
+            return True
+
+        if arg == "graph":
+            graph = _team_manager.render_task_graph()
+            if "task-" in graph:
+                console.print(Markdown(graph))
+                # Also save to file
+                graph_path = os.path.join(CWD, ".tooncode-team-graph.md")
+                try:
+                    with open(graph_path, "w", encoding="utf-8") as f:
+                        f.write(f"# Team Task Graph\n\n{graph}\n")
+                    console.print(f"[dim]Saved to {graph_path}[/dim]")
+                except Exception:
+                    pass
+            else:
+                console.print("[info]No tasks on the board yet.[/info]")
+            return True
+
+        # Parse flags: --roles, --isolation, --rounds
         roles = None
+        isolation = "thread"
+        max_rounds = 25
         task_text = arg
-        if "--roles" in arg:
-            parts_r = arg.split("--roles")
+        if "--rounds" in task_text:
+            parts_rnd = task_text.split("--rounds")
+            task_text = parts_rnd[0].strip()
+            rnd_parts = parts_rnd[1].strip().split() if len(parts_rnd) > 1 else []
+            if rnd_parts and rnd_parts[0].isdigit():
+                max_rounds = max(5, min(50, int(rnd_parts[0])))  # clamp 5-50
+                task_text = task_text + " " + " ".join(rnd_parts[1:])
+                task_text = task_text.strip()
+        if "--isolation" in task_text:
+            parts_iso = task_text.split("--isolation")
+            task_text = parts_iso[0].strip()
+            iso_parts = parts_iso[1].strip().split() if len(parts_iso) > 1 else []
+            if iso_parts and iso_parts[0] in ("thread", "process"):
+                isolation = iso_parts[0]
+                task_text = task_text + " " + " ".join(iso_parts[1:])
+                task_text = task_text.strip()
+        if "--roles" in task_text:
+            parts_r = task_text.split("--roles")
             task_text = parts_r[0].strip()
             role_parts = parts_r[1].strip().split() if len(parts_r) > 1 else []
             role_str = role_parts[0] if role_parts else ""
             if role_str:
                 roles = [r.strip() for r in role_str.split(",") if r.strip()]
 
-        summary = run_team(task_text, roles)
+        if isolation == "process":
+            console.print("[bold cyan]Isolation mode: process[/bold cyan]")
+        if max_rounds != 25:
+            console.print(f"[dim]Max rounds per agent: {max_rounds}[/dim]")
+        summary = run_team(task_text, roles, isolation=isolation, max_rounds=max_rounds)
         if summary:
             messages.append({
                 "role": "user",
@@ -4116,8 +5761,31 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         result = _build_codebase_index()
         elapsed = time.time() - t0
         n_lines = result.count("\n") + 1
-        console.print(f"[info]Index built in {elapsed:.1f}s ({n_lines} lines, {len(result)} chars). Cached to ~/.tooncode/index_cache/[/info]")
+        console.print(f"[info]Structure index: {elapsed:.1f}s ({n_lines} lines)[/info]")
         console.print(Panel(result, title="Codebase Index", border_style="cyan", expand=False))
+        # Also build semantic index if ChromaDB available
+        if _chroma_available:
+            console.print("[info]Building semantic search index...[/info]")
+            t1 = time.time()
+            sem_result = _index_codebase_semantic()
+            console.print(f"[info]Semantic index: {time.time()-t1:.1f}s — {sem_result}[/info]")
+        else:
+            console.print("[dim]Semantic search not available (pip install chromadb)[/dim]")
+        return True
+
+    elif command == "/semantic":
+        if not _chroma_available:
+            console.print("[error]ChromaDB not installed. Run: pip install chromadb[/error]")
+            return True
+        if not arg:
+            console.print("[info]Usage: /semantic <query>[/info]")
+            console.print("[info]Examples:[/info]")
+            console.print("[dim]  /semantic user authentication logic[/dim]")
+            console.print("[dim]  /semantic database connection setup[/dim]")
+            console.print("[dim]  /semantic error handling[/dim]")
+            return True
+        result = exec_semantic_search({"query": arg, "n_results": 5})
+        console.print(Panel(result, title=f"Semantic Search: {arg}", border_style="cyan"))
         return True
 
     elif command == "/clear":
@@ -4135,7 +5803,7 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         help_table.add_row("/resume, /r [num]", "List saved sessions or resume one")
         help_table.add_row("/model [name]", "Switch model or list available models")
         help_table.add_row("/cd <path>", "Change working directory")
-        help_table.add_row("/boss <task>", "Send to Claude Code to create task plan")
+        help_table.add_row("/boss <task>", "Send to Boss AI to create task plan")
         help_table.add_row("/plan", "Toggle Plan Mode (AI plans only, no file changes)")
         help_table.add_row("/tasks", "Show task list with progress")
         help_table.add_row("/do", "Execute pending tasks from plan")
@@ -4155,7 +5823,8 @@ def handle_slash_command(cmd: str, messages: list) -> Optional[bool]:
         help_table.add_row("/send <msg>", "Send message to other ToonCode windows")
         help_table.add_row("/send", "Read messages from other windows")
 
-        help_table.add_row("/index", "Rebuild codebase index (files + symbols)")
+        help_table.add_row("/index", "Rebuild codebase index (structure + semantic)")
+        help_table.add_row("/semantic <query>", "Semantic code search (AI-powered, find by meaning)")
         help_table.add_row("/init", "Create TOONCODE.md project memory")
         help_table.add_row("/config", "Show/edit config (~/.tooncode/config.json)")
         help_table.add_row("/clear", "Clear conversation history")
@@ -4385,7 +6054,7 @@ Read {{input}} and generate clear documentation with examples.
             console.print(f"[yellow]Expand failed ({e}), using original task[/yellow]")
 
         console.print(f"[dim]{expanded_task[:200]}{'...' if len(expanded_task) > 200 else ''}[/dim]")
-        console.print("[bold magenta]Step 2: Sending to Claude Code (boss)...[/bold magenta]")
+        console.print("[bold magenta]Step 2: Sending to Boss AI (boss)...[/bold magenta]")
 
         boss_prompt = f"""You are a senior software architect. Create a detailed implementation plan.
 
@@ -4414,7 +6083,7 @@ OUTPUT THE JSON ARRAY NOW:"""
             # Try Claude CLI first, fallback to own model
             claude_cmd = _find_claude_cmd()
             if claude_cmd:
-                console.print("[dim]Using Claude Code CLI...[/dim]")
+                console.print("[dim]Using Boss AI CLI...[/dim]")
                 try:
                     result = subprocess.run(
                         [claude_cmd, "--print", "--dangerously-skip-permissions"],
@@ -4498,7 +6167,7 @@ OUTPUT THE JSON ARRAY NOW:"""
                     messages.append({
                         "role": "user",
                         "content": [{"type": "text", "text":
-                            f"[Boss Plan from Claude Code]\nTask: {arg}\n\nTasks:\n{task_list_str}\n\n"
+                            f"[Boss Plan from Boss AI]\nTask: {arg}\n\nTasks:\n{task_list_str}\n\n"
                             f"These tasks are loaded. Wait for /do command to execute them.",
                             "cache_control": {"type": "ephemeral"}}],
                     })
@@ -4721,85 +6390,17 @@ OUTPUT THE JSON ARRAY NOW:"""
         return True
 
     elif command == "/init":
+        force = arg.strip() == "force"
         md_path = os.path.join(CWD, "TOONCODE.md")
-        if os.path.exists(md_path) and not arg == "force":
-            console.print(f"[info]TOONCODE.md already exists. Use /init force to recreate.[/info]")
+
+        if os.path.exists(md_path) and not force:
+            console.print(f"[info]TOONCODE.md already exists[/info]")
+            console.print(f"[dim]Use /init force to regenerate with deep analysis[/dim]")
             return True
 
-        project_name = os.path.basename(CWD)
-
-        # Scan for existing AI config files to import
-        _import_files = [
-            ("CLAUDE.md", "Claude Code"), (".claude/CLAUDE.md", "Claude Code"),
-            ("GEMINI.md", "Gemini"), (".cursorrules", "Cursor"),
-            (".cursor/rules", "Cursor"), ("COPILOT.md", "Copilot"),
-            (".github/copilot-instructions.md", "Copilot"),
-        ]
-        imported = []
-        imported_content = ""
-        for fname, source in _import_files:
-            fpath = os.path.join(CWD, fname)
-            if os.path.exists(fpath):
-                try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        ctx = f.read().strip()
-                    if ctx:
-                        imported.append((fname, source))
-                        imported_content += f"\n\n## Imported from {source} ({fname})\n{ctx}"
-                except Exception:
-                    pass
-
-        # Detect project info
-        detect_parts = []
-        # Check package.json
-        pkg_path = os.path.join(CWD, "package.json")
-        if os.path.exists(pkg_path):
-            try:
-                with open(pkg_path, "r", encoding="utf-8") as f:
-                    pkg = json.load(f)
-                detect_parts.append(f"- Type: {pkg.get('name', 'Node.js project')}")
-                detect_parts.append(f"- Description: {pkg.get('description', '')}")
-                deps = list(pkg.get("dependencies", {}).keys())[:10]
-                if deps:
-                    detect_parts.append(f"- Dependencies: {', '.join(deps)}")
-            except Exception:
-                detect_parts.append("- Type: Node.js project")
-        # Check requirements.txt
-        elif os.path.exists(os.path.join(CWD, "requirements.txt")):
-            detect_parts.append("- Type: Python project")
-            try:
-                with open(os.path.join(CWD, "requirements.txt"), "r") as f:
-                    deps = [l.strip().split("==")[0] for l in f.readlines()[:10] if l.strip() and not l.startswith("#")]
-                detect_parts.append(f"- Dependencies: {', '.join(deps)}")
-            except Exception:
-                pass
-        # Check Cargo.toml
-        elif os.path.exists(os.path.join(CWD, "Cargo.toml")):
-            detect_parts.append("- Type: Rust project")
-        elif os.path.exists(os.path.join(CWD, "go.mod")):
-            detect_parts.append("- Type: Go project")
-        elif os.path.exists(os.path.join(CWD, "composer.json")):
-            detect_parts.append("- Type: PHP project")
-        else:
-            detect_parts.append("- Type: ")
-            detect_parts.append("- Language: ")
-
-        # Build content
-        content = f"# {project_name}\n\n## Project Context\n\n"
-        content += "\n".join(detect_parts)
-        content += "\n\n## Notes\n\n- \n"
-        if imported_content:
-            content += imported_content
-
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(content)
-
-        console.print(f"[bold green]Created {md_path}[/bold green]")
-        if imported:
-            for fname, source in imported:
-                console.print(f"[dim]  Imported from {source}: {fname}[/dim]")
-        if detect_parts:
-            console.print(f"[dim]  Auto-detected project info[/dim]")
+        console.print("[bold cyan]Starting deep project analysis...[/bold cyan]")
+        result = _advanced_init()
+        console.print(f"\n[bold green]{result}[/bold green]")
         return True
 
     elif command == "/update":
@@ -4905,7 +6506,7 @@ OUTPUT THE JSON ARRAY NOW:"""
 # ============================================================================
 
 def print_banner():
-    """Print the welcome banner with gradient colors."""
+    """Print the welcome banner with gradient colors + Thai flag."""
 
     # ASCII art logo lines
     logo_lines = [
@@ -4932,7 +6533,7 @@ def print_banner():
     for i, line in enumerate(logo_lines):
         logo.append(line + "\n", style=f"bold {gradient[i % len(gradient)]}")
 
-    # Tagline
+    # Tagline with small Thai flag
     tagline = Text()
     tagline.append("                         ", style="dim")
     tagline.append("by ", style="dim")
@@ -4940,7 +6541,13 @@ def print_banner():
     tagline.append("  |  ", style="dim")
     tagline.append(f"v{VERSION}", style="bold #00ccff")
     tagline.append("  |  ", style="dim")
-    tagline.append("🇹🇭 Thai Coding Agent", style="dim white")
+    # Small Thai flag inline
+    tagline.append("█", style="bold red")
+    tagline.append("█", style="white")
+    tagline.append("█", style="bold #0033A0")
+    tagline.append("█", style="white")
+    tagline.append("█", style="bold red")
+    tagline.append(" Thai Coding Agent", style="dim white")
 
     # Count stats
     install_dir = os.path.dirname(os.path.abspath(__file__))
@@ -4970,30 +6577,20 @@ def print_banner():
     # Build status badges
     badges = Text()
     badges.append("  ")
-    # Model badge
-    badges.append(" ", style="on #6633cc")
     badges.append(f" {MODEL} ", style="bold white on #6633cc")
     badges.append(" ", style="dim")
-    # Tools badge
-    badges.append(" ", style="on #006699")
     badges.append(f" {len(TOOLS)} tools ", style="bold white on #006699")
     badges.append(" ", style="dim")
-    # Skills badge
     skill_count = len(_skills) if _skills else 0
     if skill_count > 0:
-        badges.append(" ", style="on #009966")
         badges.append(f" {skill_count} skills ", style="bold white on #009966")
         badges.append(" ", style="dim")
-    # MCP badge
     mcp_count = len(_mcp_servers) if _mcp_servers else 0
     if mcp_count > 0:
         mcp_tools = sum(len(s.tools) for s in _mcp_servers.values())
-        badges.append(" ", style="on #cc3399")
         badges.append(f" MCP:{mcp_count} ({mcp_tools} tools) ", style="bold white on #cc3399")
         badges.append(" ", style="dim")
-    # Git badge
     if has_git:
-        badges.append(" ", style="on #cc6600")
         badges.append(f" git:{git_branch or '?'} ", style="bold white on #cc6600")
 
     # Directory & date line
@@ -5019,20 +6616,16 @@ def print_banner():
             history_line.append(f"{memory_count} memories", style="dim cyan")
         history_line.append("  (/resume to load)", style="dim")
 
-    # Quick commands with icons
+    # Quick commands
     cmds = Text()
     cmds.append("  ")
-    cmd_items = [
-        ("/help", "#00ccff"), ("/boss", "#ff6600"), ("/plan", "#cc00ff"),
-        ("/save", "#00cc66"), ("/resume", "#ffcc00"), ("/continue", "#00ffcc"),
-        ("/skills", "#ff3366"), ("!cmd", "#999999"),
-    ]
-    for name, color in cmd_items:
+    for name, color in [("/help", "#00ccff"), ("/boss", "#ff6600"), ("/plan", "#cc00ff"),
+                        ("/save", "#00cc66"), ("/resume", "#ffcc00"), ("/continue", "#00ffcc"),
+                        ("/skills", "#ff3366"), ("!cmd", "#999999")]:
         cmds.append(f" {name} ", style=f"bold {color}")
         cmds.append(" ", style="dim")
 
-    # Separator
-    sep = Text("  " + "─" * 68, style="dim #333366")
+    sep = Text("  " + "-" * 68, style="dim #333366")
 
     # Print it all
     console.print()
@@ -5051,10 +6644,97 @@ def print_banner():
             cmds,
             Text(),
         ),
-        border_style="#6633cc",
+        border_style="#00f5ff",
         padding=(0, 1),
     ))
     console.print()
+
+
+def _detect_paste_language(text: str) -> str:
+    """Detect programming language from pasted code. Returns language name or empty string."""
+    text_stripped = text.strip()
+    lines = text_stripped.split("\n")
+    first_lines = "\n".join(lines[:10]).lower()
+
+    # Already wrapped in code block — extract language
+    if text_stripped.startswith("```"):
+        first_line = lines[0].strip("`").strip()
+        return first_line if first_line else ""
+
+    # Shebang
+    if text_stripped.startswith("#!"):
+        if "python" in lines[0]: return "python"
+        if "node" in lines[0]: return "javascript"
+        if "bash" in lines[0] or "sh" in lines[0]: return "bash"
+        if "ruby" in lines[0]: return "ruby"
+
+    # Python signals
+    py_signals = ["def ", "import ", "from ", "class ", "if __name__", "print(", "self.", "async def ", "elif ", "except:"]
+    if sum(1 for s in py_signals if s in text_stripped) >= 2:
+        return "python"
+
+    # JavaScript/TypeScript
+    js_signals = ["const ", "let ", "var ", "function ", "=> {", "require(", "import ", "export ", "console.log", "async "]
+    if sum(1 for s in js_signals if s in text_stripped) >= 2:
+        if "interface " in text_stripped or ": string" in text_stripped or ": number" in text_stripped:
+            return "typescript"
+        return "javascript"
+
+    # HTML
+    if "<html" in first_lines or "<!doctype" in first_lines or ("<div" in first_lines and ">" in first_lines):
+        return "html"
+
+    # CSS
+    if ("{" in text_stripped and ":" in text_stripped and ";" in text_stripped and
+            any(kw in first_lines for kw in ["color:", "margin:", "padding:", "display:", "font-", "background:"])):
+        return "css"
+
+    # Java
+    if "public class " in text_stripped or "public static void main" in text_stripped:
+        return "java"
+
+    # Go
+    if "func " in text_stripped and "package " in first_lines:
+        return "go"
+
+    # Rust
+    if "fn " in text_stripped and ("let mut " in text_stripped or "impl " in text_stripped):
+        return "rust"
+
+    # SQL
+    sql_kw = ["SELECT ", "INSERT ", "CREATE TABLE", "ALTER TABLE", "DROP ", "UPDATE ", "DELETE FROM"]
+    if any(kw in text_stripped.upper() for kw in sql_kw):
+        return "sql"
+
+    # Shell/Bash
+    bash_signals = ["#!/bin", "echo ", "if [", "fi\n", "done\n", "do\n", "export ", "alias "]
+    if sum(1 for s in bash_signals if s in text_stripped) >= 2:
+        return "bash"
+
+    # JSON
+    if (text_stripped.startswith("{") and text_stripped.endswith("}")) or \
+       (text_stripped.startswith("[") and text_stripped.endswith("]")):
+        try:
+            json.loads(text_stripped)
+            return "json"
+        except Exception:
+            pass
+
+    # YAML
+    if ":" in lines[0] and not lines[0].strip().startswith("{"):
+        yaml_count = sum(1 for l in lines[:5] if ":" in l and not l.strip().startswith("#"))
+        if yaml_count >= 3:
+            return "yaml"
+
+    # C/C++
+    if "#include" in first_lines or ("int main(" in text_stripped):
+        return "cpp"
+
+    # PHP
+    if "<?php" in first_lines:
+        return "php"
+
+    return ""
 
 
 def main(_initial_prompt=None):
@@ -5161,7 +6841,7 @@ def main(_initial_prompt=None):
                 event.current_buffer.reset()
 
             def _bottom_toolbar():
-                """Claude Code-style bottom toolbar."""
+                """Boss AI-style bottom toolbar."""
                 ctx_max = CONTEXT_WINDOWS.get(MODEL, 200_000)
                 ctx_pct = (last_input_tokens / ctx_max * 100) if last_input_tokens > 0 else 0
                 ctx_left = 100.0 - ctx_pct
@@ -5285,17 +6965,38 @@ def main(_initial_prompt=None):
             if not user_input:
                 continue
 
-            # Detect pasted long text — show summary like Claude Code
+            # Detect pasted long text — auto-detect code + syntax highlight preview
             _paste_counter = getattr(main, '_paste_counter', 0)
             lines_in = user_input.count("\n")
             if lines_in >= 3:
                 _paste_counter += 1
                 main._paste_counter = _paste_counter
                 line_count = lines_in + 1
-                # Show condensed summary
-                first_line = user_input.split("\n")[0][:60]
-                console.print(f"[bold cyan]  [ Pasted text #{_paste_counter}  +{line_count} lines  {len(user_input)} chars ][/bold cyan]")
-                console.print(f"[dim]  {first_line}{'...' if len(first_line) >= 60 else ''}[/dim]")
+
+                # Auto-detect language from content
+                detected_lang = _detect_paste_language(user_input)
+
+                if detected_lang:
+                    # Code paste — show syntax highlighted preview
+                    console.print(f"[bold cyan]  [ Pasted code #{_paste_counter}  {detected_lang}  +{line_count} lines  {len(user_input)} chars ][/bold cyan]")
+                    # Show preview with syntax highlighting (max 15 lines)
+                    preview_lines = user_input.split("\n")[:15]
+                    preview_text = "\n".join(preview_lines)
+                    if line_count > 15:
+                        preview_text += f"\n... (+{line_count - 15} more lines)"
+                    try:
+                        console.print(Syntax(preview_text, detected_lang, theme="monokai", line_numbers=True, padding=1))
+                    except Exception:
+                        console.print(f"[dim]{preview_text[:500]}[/dim]")
+
+                    # Auto-wrap in code block if not already wrapped
+                    if not user_input.strip().startswith("```"):
+                        user_input = f"```{detected_lang}\n{user_input}\n```"
+                else:
+                    # Plain text paste
+                    first_line = user_input.split("\n")[0][:60]
+                    console.print(f"[bold cyan]  [ Pasted text #{_paste_counter}  +{line_count} lines  {len(user_input)} chars ][/bold cyan]")
+                    console.print(f"[dim]  {first_line}{'...' if len(first_line) >= 60 else ''}[/dim]")
             console.print()
 
             _show_status = True  # show status after next real interaction
@@ -5709,6 +7410,7 @@ def _cleanup_all():
 
     # 4. Team agents
     try:
+        _team_manager.stop()
         _team_running = False
     except Exception:
         pass
