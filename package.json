@@ -34,7 +34,8 @@
     "README.md"
   ],
   "scripts": {
-    "postinstall": "node bin/postinstall.js"
+    "postinstall": "node bin/postinstall.js",
+    "prepublishOnly": "node bin/sync-version.js"
   },
   "engines": {
     "node": ">=16"
