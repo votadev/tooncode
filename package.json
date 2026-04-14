@@ -1,6 +1,6 @@
 {
   "name": "@votadev/tooncode",
-  "version": "2.6.5",
+  "version": "2.6.6",
   "description": "🇹🇭 Thai AI Coding Agent CLI — powered by free models. 21 tools, multi-agent team, semantic search, browser automation, MCP servers.",
   "author": "VotaLab",
   "license": "MIT",
@@ -35,7 +35,7 @@
   ],
   "scripts": {
     "postinstall": "node bin/postinstall.js",
-    "prepublishOnly": "node bin/sync-version.js"
+    "release": "node bin/sync-version.js && npm publish --access public"
   },
   "engines": {
     "node": ">=16"
