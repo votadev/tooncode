@@ -1,8 +1,12 @@
+import re
 from setuptools import setup, find_packages
+
+with open("tooncode.py", encoding="utf-8") as f:
+    version = re.search(r'VERSION\s*=\s*"(.+?)"', f.read()).group(1)
 
 setup(
     name="tooncode",
-    version="2.0.0",
+    version=version,
     description="Thai AI Coding Agent CLI - Free, 21 tools, multi-agent team, semantic search",
     author="VotaLab",
     py_modules=["tooncode", "tui"],

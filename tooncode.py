@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.6.2"
+VERSION = "2.6.4"
 
 import httpx
 import json
@@ -2723,10 +2723,22 @@ class _BrowserWorker:
 
     def _auto_install(self):
         """Auto-install Playwright chromium binaries if missing."""
+        console.print("[dim]Checking/Installing Playwright browsers...[/dim]")
+        # Try npx first (Node.js install)
         try:
-            console.print("[dim]Checking/Installing Playwright browsers...[/dim]")
             subprocess.run(
                 ["npx", "playwright", "install", "chromium"],
+                check=True, timeout=180,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            console.print("[green]Playwright chromium installed/ready[/green]")
+            return True
+        except Exception:
+            pass
+        # Fallback: try Python playwright module (works on Mac/pip installs)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
                 check=True, timeout=180,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
@@ -2744,6 +2756,8 @@ class _BrowserWorker:
             # Detect headless environment
             self._headless = os.environ.get("PLAYWRIGHT_HEADLESS", "false").lower() == "true"
             if platform.system() == "Linux" and not os.environ.get("DISPLAY"):
+                self._headless = True
+            elif platform.system() == "Darwin" and os.environ.get("SSH_CONNECTION"):
                 self._headless = True
             self._stop = False
             self._ready.clear()
@@ -2885,7 +2899,7 @@ def exec_browser(args: dict) -> str:
                 console.print("[yellow]Playwright not available — falling back to web_fetch[/yellow]")
                 return exec_web_fetch({"url": url, "max_length": 20000})
             elif action == "text" or action == "screenshot":
-                return "[error: browser not available. On Ubuntu run: sudo npx playwright install-deps && npx playwright install chromium]"
+                return "[error: browser not available. Ubuntu: sudo npx playwright install-deps && npx playwright install chromium | Mac: python3 -m playwright install chromium]"
             return "[error: could not start browser]"
 
     if action == "open":
