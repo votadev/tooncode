@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.6.7"
+VERSION = "2.6.8"
 
 import httpx
 import json
@@ -6511,7 +6511,9 @@ def main(_initial_prompt=None):
                                encoding="utf-8", errors="replace", timeout=10)
             latest = r.stdout.strip()
             if latest and latest != VERSION:
-                console.print(f"[bold cyan]  Update available: v{VERSION} → v{latest} (/update to install)[/bold cyan]")
+                def _ver_tuple(v): return tuple(int(x) for x in v.split("."))
+                if _ver_tuple(latest) > _ver_tuple(VERSION):
+                    console.print(f"[bold cyan]  Update available: v{VERSION} → v{latest} (/update to install)[/bold cyan]")
         except Exception:
             pass
     threading.Thread(target=_check_update, daemon=True).start()
