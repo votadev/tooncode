@@ -8,7 +8,7 @@ Usage:
     python tooncode.py
 """
 
-VERSION = "2.6.8"
+VERSION = "2.6.9"
 
 import httpx
 import json
@@ -4619,10 +4619,11 @@ def stream_response(messages: list, renderer: StreamRenderer) -> dict:
                 "input": block.get("input", {}),
             })
 
-    # If response is completely empty, return an error so the retry logic can handle it
+    # If response is completely empty, signal it distinctly from API errors
+    # (model may still be thinking — caller should wait longer before retry)
     if not result_content:
         console.print("[yellow](model returned empty response)[/yellow]")
-        return {"content": [{"type": "text", "text": "Error: empty response from model"}], "stop_reason": "error"}
+        return {"content": [{"type": "text", "text": "Empty: model returned no content"}], "stop_reason": "empty"}
 
     return {"content": result_content, "stop_reason": stop_reason}
 
@@ -6892,14 +6893,20 @@ def main(_initial_prompt=None):
 
                 content = response.get("content", [])
 
-                # -- API error detection: retry up to 3 times --
+                # -- Detect error type: API error vs empty response (model thinking) --
                 is_error = False
+                is_empty = False
                 for block in content:
-                    if block.get("type") == "text" and block.get("text", "").startswith(("API Error", "Connection error", "Request timed out", "Error:")):
+                    txt = block.get("text", "") if block.get("type") == "text" else ""
+                    if txt.startswith(("API Error", "Connection error", "Request timed out", "Error:")):
                         is_error = True
+                        break
+                    elif txt.startswith("Empty:"):
+                        is_empty = True
                         break
 
                 if is_error:
+                    # API unreachable — short retry
                     api_retries += 1
                     if api_retries <= 2:
                         wait = min(api_retries * 3, 6)
@@ -6917,6 +6924,27 @@ def main(_initial_prompt=None):
                             continue
                         else:
                             console.print("[error]All models failed. Waiting for your input.[/error]")
+                            api_retries = 0
+                            break
+                elif is_empty:
+                    # Model returned empty — likely still thinking, wait longer
+                    # Total wait: 900s = 15 min before fallback
+                    api_retries += 1
+                    if api_retries <= 5:
+                        wait = 180  # 3 min each × 5 = 15 min total
+                        console.print(f"[yellow]Model thinking... retry {api_retries}/5 in 3m[/yellow]")
+                        for _ in range(wait):
+                            time.sleep(1)
+                        continue
+                    else:
+                        fallback = _get_fallback_model()
+                        if fallback:
+                            console.print(f"[bold yellow]Model {MODEL} still empty after 15min. Switching to fallback: {fallback}[/bold yellow]")
+                            MODEL = fallback
+                            api_retries = 0
+                            continue
+                        else:
+                            console.print("[error]Model returned empty after 15min. Try /model or rephrase.[/error]")
                             api_retries = 0
                             break
                 else:
